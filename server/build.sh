@@ -1,0 +1,1 @@
+cd rustcode && maturin develop --release

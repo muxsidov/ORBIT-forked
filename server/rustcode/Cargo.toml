@@ -1,0 +1,32 @@
+[package]
+name = "rustcode"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name="rustcode"
+crate-type = ["cdylib"]
+
+[dependencies]
+ark-ec = "0.5"
+ark-ff = "0.5"
+ark-std = "0.5"
+ark-bn254 = "0.5"
+ark-serialize = "0.5"
+pyo3-log = "0.12.1"
+pyo3 = { version = "0.23.3", features = ["extension-module"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes = "0.8.4"
+ctr = "0.9"
+sha2 = "0.10.8"
+base64 = "0.22.1"
+p256 = "0.13"
+ark-secp256r1 = "0.5.0"
+sha3 = "0.10"
+# poseidon_bfsecp256r1={path="../poseidon_bfsecp256r1"}
+# secq256r1={path = "../secq256r1"}
+num-bigint = {version="0.4.4", features = ["rand"]}
+hex = "0.4"

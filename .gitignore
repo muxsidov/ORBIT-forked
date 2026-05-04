@@ -1,0 +1,17 @@
+# Python
+server/.venv/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# Rust build artifacts
+server/rustcode/target/
+
+# Node
+node_modules/
+
+# Windows artifacts
+*.Zone.Identifier
+
+# Claude session data
+.claude/
