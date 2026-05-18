@@ -125,25 +125,28 @@ fn derive_key(a: &[u8], b: &[u8]) -> [u8; 32] {
     hash_array
 }
 
-// Currently only support tag = 1
+fn h_of_id(param: &ParamWaters, id: u8) -> G {
+    (0u8..8).filter(|i| (id >> i) & 1 == 1)
+        .fold(param.h_0, |acc, i| acc + param.h_vec[i as usize])
+}
+
 fn water_decrypt(param: &ParamWaters, id: u8, message: Vec<Vec<u8>>) -> pairing::PairingOutput<ark_ec::bn::Bn<ark_bn254::Config>>{
-    assert_eq!(id, 1);
     let mut rng = ark_std::test_rng();
 
     let c1: pairing::PairingOutput<ark_ec::bn::Bn<ark_bn254::Config>> = pairing::PairingOutput::<ark_ec::bn::Bn<ark_bn254::Config>>::deserialize_compressed(&message[0][..]).unwrap();
     let c2 = G2::deserialize_compressed(&message[1][..]).unwrap();
     let c3 = G::deserialize_compressed(&message[2][..]).unwrap();
 
-    // We assume key is given. Here we emulate the given key by computing it directly.
+    // Derive decryption key from MSK (beta_secret is the master secret scalar in params).
     let rand_r = ScalarField::rand(&mut rng);
-    let sk1= (param.g_alpha*param.beta_secret) + ((param.h_0 + param.h_vec[0]) * rand_r);
+    let sk1 = (param.g_alpha * param.beta_secret) + (h_of_id(param, id) * rand_r);
     let sk3 = param.g2 * rand_r;
     let decrypt_m = c1 + Bn254::pairing(c3, sk3) - Bn254::pairing(sk1, c2);
-    
+
     decrypt_m
 }
 
-pub fn evaluate_paymentbox(params:String, key_mat_enc:Vec<Vec<u8>>, rtag:Vec<Vec<u8>>, enc_sig1_1:Vec<u8>, enc_sig2 :Vec<u8>, enc_sig3 :Vec<u8>, enc_sig1_vec:Vec<Vec<u8>>, shared_key:Vec<u8>, message_pattern:Vec<u8>, garble_message_size :usize, MAX_ITEM :usize){
+pub fn evaluate_paymentbox(params:String, key_mat_enc:Vec<Vec<u8>>, rtag:Vec<Vec<u8>>, enc_sig1_1:Vec<u8>, enc_sig2 :Vec<u8>, enc_sig3 :Vec<u8>, enc_sig1_vec:Vec<Vec<u8>>, shared_key:Vec<u8>, message_pattern:Vec<u8>, garble_message_size :usize, MAX_ITEM :usize, tag: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let par: ParamWaters = serde_json::from_str(&params).unwrap();
     let g = par.g;
     let g2 = par.g2;
@@ -192,7 +195,6 @@ pub fn evaluate_paymentbox(params:String, key_mat_enc:Vec<Vec<u8>>, rtag:Vec<Vec
         counter+=1;
     }
 
-    let tag = 1; // NOTE: tag should be incrementally sampled/ randomly sampled instead, we hardcoded to 1
     let rtag_dec = water_decrypt(&par, tag, rtag);
     let mut hasher = Sha3_256::new();
     hasher.update(rtag_dec.to_string()); //Better to use serialzed byte instead. String for convenient.
@@ -253,9 +255,13 @@ pub fn evaluate_paymentbox(params:String, key_mat_enc:Vec<Vec<u8>>, rtag:Vec<Vec
         
     }
 
-    // println!("Signature OK");
-    // debug!("{}", "Siganture OK");
-
+    let mut sk1_bytes = Vec::new();
+    sig_1.serialize_compressed(&mut sk1_bytes).unwrap();
+    let mut sk2_bytes = Vec::new();
+    sig_2.serialize_compressed(&mut sk2_bytes).unwrap();
+    let mut sk3_bytes = Vec::new();
+    sig_3.serialize_compressed(&mut sk3_bytes).unwrap();
+    (sk1_bytes, sk2_bytes, sk3_bytes)
 }
 
 pub fn evaluate_ecdsa(params:String, key_mat_enc:Vec<Vec<u8>>, rtag:Vec<Vec<u8>>,enc_r:Vec<u8>, enc_s0 :Vec<u8>, enc_svec:Vec<Vec<u8>>, shared_key:Vec<u8>, message_pattern:Vec<u8>, garble_message_size :usize, MAX_ITEM :usize){
@@ -367,8 +373,8 @@ pub fn evaluate_ecdsa(params:String, key_mat_enc:Vec<Vec<u8>>, rtag:Vec<Vec<u8>>
         let r_prime_right = Secp256r1Scalar::from_bigint(r_prime.into_bigint()).unwrap();
 
         // Printing garbled ECDSA key
-        debug!("r  = {:?}", r_right.into_bigint().to_string());
-        debug!("s  = {:?}", s.into_bigint().to_string());
+        // debug!("r  = {:?}", r_right.into_bigint().to_string());
+        // debug!("s  = {:?}", s.into_bigint().to_string());
 
         // debug!("Asserting ECDSA Signature");
         assert_eq!(r_right,r_prime_right,"Signature does not checkout");

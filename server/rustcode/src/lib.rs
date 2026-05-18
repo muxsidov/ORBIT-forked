@@ -249,14 +249,17 @@ fn usize_to_fixed_bit_array_8(value: usize) -> [bool; 8] {
 }
 
 
-// Currently only support tag = 1
+fn h_of_id(param: &ParamWaters, id: u8) -> G {
+    (0u8..8).filter(|i| (id >> i) & 1 == 1)
+        .fold(param.h_0, |acc, i| acc + param.h_vec[i as usize])
+}
+
 fn water_encrypt(param: &ParamWaters, id: u8, message: pairing::PairingOutput<ark_ec::bn::Bn<ark_bn254::Config>>) -> Vec<Vec<u8>>{
-    assert_eq!(id, 1);
     let mut rng = ark_std::test_rng();
     let rand_t = ScalarField::rand(&mut rng);
     let c1 = Bn254::pairing(param.g_alpha, param.g2_beta)*rand_t + message;
     let c2 = param.g2 * rand_t;
-    let c3 = (param.h_0+param.h_vec[0]) * rand_t;
+    let c3 = h_of_id(param, id) * rand_t;
 
     let mut c1_byte = Vec::new();
     c1.serialize_compressed(&mut c1_byte).unwrap();
@@ -480,10 +483,125 @@ fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_
     // let _test_deserialize: PaymentBox = serde_json::from_str(&json_string).unwrap();
   
     Ok(json_string)
-} 
+}
+
+// Alice runs this on her device to garble a Waters activation key for Bob without the server.
+// osk_sk1/sk2/sk3 are Alice's recovered key bytes (proof of delegation authority).
+// tag2 is the identity for Bob's new key — must differ from Alice's tag to prevent reuse.
+#[pyfunction]
+fn garble_redelegate(param_str: String, osk_sk1: Vec<u8>, osk_sk2: Vec<u8>, osk_sk3: Vec<u8>, shared_key_list: &'_ Bound<'_, PyList>, garble_message_size: usize, MAX_ITEM: usize, tag2: u8) -> PyResult<String> {
+    let param: ParamWaters = serde_json::from_str(&param_str).unwrap();
+    let mut rng = ark_std::test_rng();
+    let g = param.g;
+    let g_alpha = param.g_alpha;
+    let g2 = param.g2;
+    let g2_beta = param.g2_beta;
+
+    // Verify Alice holds a valid Waters key (proof of delegation authority).
+    let osk_sk1_pt = G::deserialize_compressed(&osk_sk1[..]).expect("invalid sk1");
+    let osk_sk2_pt = G::deserialize_compressed(&osk_sk2[..]).expect("invalid sk2");
+    let osk_sk3_pt = G2::deserialize_compressed(&osk_sk3[..]).expect("invalid sk3");
+    assert_eq!(Bn254::pairing(g, osk_sk3_pt), Bn254::pairing(osk_sk2_pt, g2), "osk: dk2/dk3 mismatch");
+
+    let msk = param.g_alpha * param.beta_secret;
+    let max_message_size = 40;
+    assert_eq!(max_message_size, (MAX_ITEM.ilog2() as usize) * garble_message_size);
+    let u_prime = param.h_0;
+    let u_vec = &param.h_vec;
+
+    let rand_r = ScalarField::rand(&mut rng);
+
+    let mut running_rand_ss = G::zero();
+    let mut sig1_vec_masked = vec![];
+
+    for i in 0..garble_message_size {
+        let new_share = G::rand(&mut rng);
+        running_rand_ss += new_share;
+        sig1_vec_masked.push(new_share);
+
+        if MAX_ITEM == 2 {
+            sig1_vec_masked.push(u_vec[i] * rand_r + new_share);
+        } else {
+            let step = MAX_ITEM.ilog2() as usize;
+            let subset_uvec = &u_vec[i * step..(i + 1) * step];
+            for j in 1..MAX_ITEM {
+                let array = usize_to_fixed_bit_array_8(j);
+                let summed = subset_uvec.iter().enumerate()
+                    .filter(|(index, _)| array[*index])
+                    .fold(G::zero(), |sum, (_, val)| sum + (*val * rand_r));
+                sig1_vec_masked.push(summed + new_share);
+            }
+        }
+    }
+
+    let mask_ss = -running_rand_ss;
+    let sig_1_hprime_masked = msk + (u_prime * rand_r) + mask_ss;
+    let sig_2 = g * rand_r;
+    let sig_3 = g2 * rand_r;
+
+    let shared_key_byte: Vec<Vec<u8>> = shared_key_list
+        .iter()
+        .map(|item| item.downcast::<PyBytes>().unwrap().as_bytes().to_vec())
+        .collect();
+    let mut aon_key_share_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut aon_key_bytes: [u8; 32] = [0u8; 32];
+    for _ in 0..garble_message_size {
+        let mut random_bytes = [0u8; 32];
+        rng.fill(&mut random_bytes);
+        aon_key_share_bytes.push(random_bytes.to_vec());
+        for j in 0..32 { aon_key_bytes[j] ^= random_bytes[j]; }
+    }
+
+    let rand_m = ScalarField::rand(&mut rng);
+    let rand_m_t = Bn254::pairing(g, g2) * rand_m;
+    let mut hasher = Sha3_256::new();
+    hasher.update(rand_m_t.to_string());
+    let hashed = hasher.finalize().to_vec();
+    for j in 0..32 { aon_key_bytes[j] ^= hashed[j]; }
+    let enc_rtag = water_encrypt(&param, tag2, rand_m_t);
+
+    let mut enc_sig1_vec = Vec::new();
+    let mut key_mat_vec: Vec<Vec<u8>> = Vec::new();
+    for i in 0..garble_message_size {
+        for j in 0..MAX_ITEM {
+            let mut sig_1_item = Vec::new();
+            sig1_vec_masked[i * MAX_ITEM + j].serialize_compressed(&mut sig_1_item).unwrap();
+            let localkey = shared_key_byte[i * MAX_ITEM + j].clone();
+            let mut random_bytes = [0u8; 32];
+            rng.fill(&mut random_bytes);
+            key_mat_vec.push(encrypt(&concat_two(&aon_key_share_bytes[i], &random_bytes), localkey.as_slice(), 0));
+            let final_localkeymat = derive_key(&aon_key_bytes, &random_bytes);
+            enc_sig1_vec.push(encrypt(&sig_1_item[..], &final_localkeymat, 0));
+        }
+    }
+
+    let mut sig_1_firstpart = Vec::new();
+    sig_1_hprime_masked.serialize_compressed(&mut sig_1_firstpart).unwrap();
+    let enc_sig1_firstpart = encrypt(&sig_1_firstpart[..], &aon_key_bytes, 1);
+
+    let mut sig_2_byte = Vec::new();
+    sig_2.serialize_compressed(&mut sig_2_byte).unwrap();
+    let enc_sig2 = encrypt(&sig_2_byte[..], &aon_key_bytes, 2);
+
+    let mut sig_3_byte = Vec::new();
+    sig_3.serialize_compressed(&mut sig_3_byte).unwrap();
+    let enc_sig3 = encrypt(&sig_3_byte[..], &aon_key_bytes, 3);
+
+    let pay_box = PaymentBox {
+        tag: tag2,
+        rtag: enc_rtag,
+        sig3: enc_sig3,
+        sig2: enc_sig2,
+        sig1_firstpart: enc_sig1_firstpart,
+        sig1_vec: enc_sig1_vec,
+        key_mat_enc: key_mat_vec,
+    };
+
+    Ok(serde_json::to_string(&pay_box).unwrap())
+}
 
 #[pyfunction]
-fn test_rdelegate_local(params:String, garble_message : String, shared_key_list:  &'_ Bound<'_, PyList>,message_patern_list:  &'_ Bound<'_, PyList>,  max_selectable_elem: usize, max_item: usize){
+fn test_rdelegate_local(params:String, garble_message : String, shared_key_list:  &'_ Bound<'_, PyList>,message_patern_list:  &'_ Bound<'_, PyList>,  max_selectable_elem: usize, max_item: usize) -> PyResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let paybox: PaymentBox = serde_json::from_str(&garble_message).unwrap();
 
     let shared_key_bytes: Vec<Vec<u8>> = shared_key_list
@@ -503,7 +621,8 @@ fn test_rdelegate_local(params:String, garble_message : String, shared_key_list:
     })
     .collect();
 
-    pbcrypto::evaluate_paymentbox(params, paybox.key_mat_enc, paybox.rtag, paybox.sig1_firstpart, paybox.sig2, paybox.sig3,paybox.sig1_vec, shared_key_bytes, message_pattern, max_selectable_elem, max_item);
+    let (sk1, sk2, sk3) = pbcrypto::evaluate_paymentbox(params, paybox.key_mat_enc, paybox.rtag, paybox.sig1_firstpart, paybox.sig2, paybox.sig3, paybox.sig1_vec, shared_key_bytes, message_pattern, max_selectable_elem, max_item, paybox.tag);
+    Ok((sk1, sk2, sk3))
 }
 
 #[pyfunction]
@@ -1094,6 +1213,7 @@ fn rustcode(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_params_ecdsa, m)?)?;
     m.add_function(wrap_pyfunction!(water_unlock_solidity, m)?)?;
     m.add_function(wrap_pyfunction!(garble_waters, m)?)?;
+    m.add_function(wrap_pyfunction!(garble_redelegate, m)?)?;
     m.add_function(wrap_pyfunction!(garble_ecdsa, m)?)?;
     // m.add_function(wrap_pyfunction!(poseidon, m)?)?;
 

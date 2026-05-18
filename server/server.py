@@ -10,7 +10,7 @@ import sys, os
 from base64 import urlsafe_b64encode, urlsafe_b64decode
 from flask import Flask, session, request, redirect, abort, jsonify
 
-from rustcode import test_water, test_ecdsa, test_activate, test_unlock, test_dsign_local, test_rdelegate_local, garble_waters, garble_ecdsa, generate_params_waters,generate_params_ecdsa, test_encrypt, water_unlock_solidity
+from rustcode import test_water, test_ecdsa, test_activate, test_unlock, test_dsign_local, test_rdelegate_local, garble_waters, garble_redelegate, garble_ecdsa, generate_params_waters,generate_params_ecdsa, test_encrypt, water_unlock_solidity
 # poseidon
 
 import os
@@ -697,10 +697,70 @@ def benchmark_activate():
     
 
 
+def test_redelegate_full():
+    """End-to-end test: server delegates to Alice, then Alice re-delegates offline to Bob."""
+    nusecount = 5
+    num_possible_item_per_elem = 256
+
+    # --- Step 1: Bank issues garbled circuit to Alice ---
+    targetsk_alice = ec.generate_private_key(ec.SECP256R1())
+    targetpk_alice = targetsk_alice.public_key()
+    shared_key_arr_alice = []
+    target_shared_alice = []
+    message_pattern_alice = []
+    for i in range(nusecount):
+        for j in range(num_possible_item_per_elem):
+            priv = ec.generate_private_key(ec.SECP256R1())
+            sk = priv.exchange(ec.ECDH(), targetpk_alice)
+            shared_key_arr_alice.append(sk)
+            if j == 1:  # Alice's ECDH output byte = 1 for every slot (test fixture)
+                target_shared_alice.append(sk)
+                message_pattern_alice.append(1)
+
+    alice_box = garble_waters(water_parameter, shared_key_arr_alice, nusecount, num_possible_item_per_elem)
+
+    # --- Step 2: Alice evaluates to recover (sk1, sk2, sk3) ---
+    (sk1, sk2, sk3) = test_rdelegate_local(
+        water_parameter, alice_box,
+        target_shared_alice, message_pattern_alice,
+        nusecount, num_possible_item_per_elem
+    )
+    print("Alice evaluated: sk1 len", len(sk1), "sk2 len", len(sk2), "sk3 len", len(sk3))
+
+    # --- Step 3: Alice re-delegates to Bob (no server) ---
+    targetsk_bob = ec.generate_private_key(ec.SECP256R1())
+    targetpk_bob = targetsk_bob.public_key()
+    shared_key_arr_bob = []
+    target_shared_bob = []
+    message_pattern_bob = []
+    for i in range(nusecount):
+        for j in range(num_possible_item_per_elem):
+            priv = ec.generate_private_key(ec.SECP256R1())
+            sk = priv.exchange(ec.ECDH(), targetpk_bob)
+            shared_key_arr_bob.append(sk)
+            if j == 1:
+                target_shared_bob.append(sk)
+                message_pattern_bob.append(1)
+
+    bob_box = garble_redelegate(
+        water_parameter, sk1, sk2, sk3,
+        shared_key_arr_bob, nusecount, num_possible_item_per_elem, 2  # tag2 = 2
+    )
+    print("Alice garbled Bob's circuit")
+
+    # --- Step 4: Bob evaluates his garbled circuit ---
+    test_rdelegate_local(
+        water_parameter, bob_box,
+        target_shared_bob, message_pattern_bob,
+        nusecount, num_possible_item_per_elem
+    )
+    print("RDelegate full test PASSED: Bob's Waters key verified")
+
+
 def main():
     # benchmark_delegation_noserver()
     # return
-    
+
     print(__doc__)
     # benchmark_delegation()
     # ssl_context=("/home/azureuser/fullchain.pem","/home/azureuser/privkey.pem")
