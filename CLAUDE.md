@@ -112,6 +112,16 @@ Linker config is in `.cargo/config.toml` (Linux NDK paths). If NDK symlinks brea
 7. Recipient: picks random pattern, 5 ECDH ops against Alice's eph keys → `paymentbox()` JNI → `(sk1', sk2', sk3')` logged as `REDELEGATE SUCCESS!`
 8. Alice's card removed (dmk consumed, one-timeness enforced)
 
+### QR Transfer (device-to-device via printed/displayed QR)
+1. User taps "QR" on a Signing Token card
+2. App encodes `hiding_sign_vec2` (`{"sk1":"<hex>","sk2":"<hex>","sk3":"<hex>"}`, ~300 chars) as a QR bitmap and shows it in a dialog
+3. User dismisses dialog → Alice's card removed (dmk consumed, one-timeness enforced)
+4. On Bob's device: tap the camera FAB (bottom-right) → ZXing scanner opens
+5. Bob scans the QR → `MainActivity.addCardFromQR()` parses `{sk1, sk2, sk3}` and creates a new `DelegatedData` card
+6. Bob's card uses `hardcodedParams` (loaded from `res/raw/waters_params.json`) as `hiding_sign` — both **Pay** and **Re-delegate** work on the scanned card
+
+**Why `params` is not in the QR:** `ParamWaters` JSON is ~30 KB (8,192 bytes of h_vec curve points that resist compression); QR max is ~3 KB. Instead, `waters_params.json` is bundled as a raw resource — safe because `generate_params_waters()` uses `ark_std::test_rng()` (fixed seed), so params are **identical on every server restart** and never need to be transmitted.
+
 ## Key Data Structures
 
 - `TestData` — server response: `{epk: base64url, params: JSON string, msg: JSON string}`
@@ -164,10 +174,19 @@ Alice can re-delegate her activation key to a recipient without the server. The 
 Waters-only dmk architecture is implemented end-to-end:
 - **"New"** → server issues Waters garbled circuit → Rust evaluates → `(sk1, sk2, sk3)` stored in "Signing Token" card
 - **"Pay"** → demo placeholder: logs `PAYMENT ACCEPTED (demo)` → card disappears (dmk consumed)
-- **"Re-delegate"** → fully offline: reads stored Waters key from card → `garble_redelegate()` → recipient evaluates → logs `REDELEGATE SUCCESS!` → card disappears (dmk consumed)
-- One-timeness enforced: either action removes Alice's card; she cannot use the dmk twice
+- **"Re-delegate"** (purple button) → fully offline: reads stored Waters key from card → `garble_redelegate()` → recipient evaluates → logs `REDELEGATE SUCCESS!` → card disappears (dmk consumed). Disabled on scanned cards that have no params (`hiding_sign.isEmpty()`).
+- **"QR"** (teal button) → encodes `{sk1, sk2, sk3}` as QR bitmap in a dialog; card disappears on dismiss (dmk consumed)
+- **Scan FAB** (camera icon, bottom-right) → ZXing scanner; scanned card gets hardcoded params → both Pay and Re-delegate work
+- One-timeness enforced: Pay, Re-delegate, and QR each remove Alice's card
 
 ECDSA variant (`/api/delegatedpresigecdsa`, `paymentboxecdsa()` JNI, `zecdsa.sol`) is fully implemented in the server and JNI but not exposed in the current UI.
+
+### QR Transfer Dependencies
+- `app/build.gradle.kts`: `com.journeyapps:zxing-android-embedded:4.3.0`
+- `AndroidManifest.xml`: `CAMERA` permission
+- `res/raw/waters_params.json`: bundled params (30 KB, deterministic)
+- `MainActivity.kt`: `hardcodedParams` (lazy-loaded from raw resource in `onCreate`), `qrScanLauncher` (ZXing `ScanContract`), `addCardFromQR()`
+- `PaymentBoxAdapter.kt`: `btnQR` in `ViewHolder`, `generateQrBitmap()` helper
 
 NDK note: Linux NDK r23b is downloaded to `/tmp/android-ndk-r23b` during the WSL session (not persistent — re-download on reboot with the command in the recompile section above). The Windows NDK in `AppData/Local/Android/Sdk/ndk/23.1.7779620/` has only Windows binaries and cannot cross-compile from WSL.
 
