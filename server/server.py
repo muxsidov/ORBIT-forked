@@ -19,8 +19,79 @@ import json
 import base64
 import asn1
 import pem
-import math 
+import math
 import time
+
+# ── Blockchain (zfairexchange.sol on Sepolia) ─────────────────────────────
+from web3 import Web3
+from eth_account import Account as EthAccount
+from solcx import compile_source, install_solc as _install_solc
+
+ETH_PRIVATE_KEY = os.environ.get("ETH_PRIVATE_KEY", "")
+ALCHEMY_URL     = os.environ.get("ALCHEMY_URL", "")
+HTLC_ADDRESS    = "0xF7cFB3FBE766A1Af18218e1498e2E504C231369B"
+CHAIN_ID        = 11155111
+
+_w3            = None
+_eth_acct      = None
+_htlc          = None   # contract instance
+_htlc_setup_ok = False  # whether setup() has been called this session
+
+def _init_web3():
+    global _w3, _eth_acct, _htlc
+    if _w3 is not None:
+        return
+    if not ETH_PRIVATE_KEY or not ALCHEMY_URL:
+        raise RuntimeError("Set ETH_PRIVATE_KEY and ALCHEMY_URL env vars before using /api/pay")
+    _w3 = Web3(Web3.HTTPProvider(ALCHEMY_URL))
+    _eth_acct = EthAccount.from_key(ETH_PRIVATE_KEY)
+    _install_solc('0.8.0', show_progress=False)
+    sol_dir = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(sol_dir, 'zfairexchange.sol')) as f:
+        src = f.read()
+    compiled = compile_source(src, output_values=['abi', 'bin'], solc_version='0.8.0')
+    _, iface = compiled.popitem()
+    _htlc = _w3.eth.contract(
+        address=Web3.to_checksum_address(HTLC_ADDRESS),
+        abi=iface['abi']
+    )
+
+def _send_tx(fn, value=0):
+    tx = fn.build_transaction({
+        'from':     _eth_acct.address,
+        'nonce':    _w3.eth.get_transaction_count(_eth_acct.address, 'pending'),
+        'gas':      5_000_000,
+        # 2x current gas price: Sepolia gas spikes leave exact-price txs stuck in the mempool
+        'gasPrice': int(_w3.eth.gas_price * 2),
+        'chainId':  CHAIN_ID,
+        'value':    value,
+    })
+    signed = _eth_acct.sign_transaction(tx)
+    tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+    return _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+
+def _g1(p):
+    return (int(p['x']), int(p['y']))
+
+def _g2(p):
+    return ([int(p['x'][0]), int(p['x'][1])], [int(p['y'][0]), int(p['y'][1])])
+
+def _ensure_setup():
+    global _htlc_setup_ok
+    if _htlc_setup_ok:
+        return
+    sol = json.loads(water_unlock_solidity(water_parameter, 1))
+    param_tuple = (
+        _g1(sol['g']),
+        _g2(sol['g2']),
+        _g1(sol['g1a']),
+        _g2(sol['g2b']),
+        _g1(sol['u0']),
+        [_g1(u) for u in sol['u_vec']],
+    )
+    _send_tx(_htlc.functions.setup(param_tuple))
+    _htlc_setup_ok = True
+# ─────────────────────────────────────────────────────────────────────────
 from asn1crypto.core import Sequence
 from pyasn1.codec.ber import decoder as pyasn1decoder
 from cryptography import x509
@@ -136,9 +207,25 @@ def getpresig():
             )
             shared_key_arr.append(shared_key)
     garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem)
-    # print("Obtained garble_msg")
 
-    return jsonify({"epk": urlsafe_b64encode(epk).decode("ascii"), "params": water_parameter, "msg": garble_msg})
+    # Bank locks ETH in HTLC — this card now represents a redeemable coin
+    contract_id_hex = ""
+    try:
+        _init_web3()
+        _ensure_setup()
+        hashlock = 1
+        timelock = int(time.time()) + 3600
+        receipt_new = _send_tx(
+            _htlc.functions.newContract(_eth_acct.address, hashlock, timelock),
+            value=_w3.to_wei(0.01, 'ether')
+        )
+        logs = _htlc.events.HTLCETHNew().process_receipt(receipt_new)
+        contract_id_hex = logs[0]['args']['contractId'].hex()
+        print(f"[NEW] HTLC created, contract_id={contract_id_hex}")
+    except Exception as e:
+        print(f"[WARN] HTLC newContract skipped: {e}")
+
+    return jsonify({"epk": urlsafe_b64encode(epk).decode("ascii"), "params": water_parameter, "msg": garble_msg, "contract_id": contract_id_hex})
 
 def getpresigecdsa_fn(att_json):
     is_valid_att, targetpk, nusecount = verify_attestation(att_json)
@@ -228,6 +315,72 @@ def waters_solidity_params():
     id = int(request.args.get('id', 1))
     result = water_unlock_solidity(water_parameter, id)
     return jsonify(json.loads(result))
+
+@app.route('/api/redelegate', methods=['POST'])
+def redelegate():
+    """Withdraw Alice's HTLC (recovering her ETH), then create a fresh HTLC for Bob.
+
+    Option A shortcut: the same tag=1 Waters key unlocks both Alice's and Bob's HTLC.
+    Option B (future): garble_redelegate() would derive a new key for tag=2 so Alice
+    and Bob have cryptographically distinct keys — see CLAUDE.md Possible Next Steps.
+    """
+    try:
+        _init_web3()
+        _ensure_setup()
+
+        # Withdraw Alice's HTLC first to recover the locked ETH
+        alice_contract_id_hex = request.json.get('contract_id', '')
+        if alice_contract_id_hex:
+            try:
+                sol = json.loads(water_unlock_solidity(water_parameter, 1))
+                alice_contract_id_bytes = bytes.fromhex(alice_contract_id_hex.lstrip('0x'))
+                preimage = (_g1(sol['sk1']), _g1(sol['sk2']), _g2(sol['sk3']))
+                _send_tx(_htlc.functions.withdraw(alice_contract_id_bytes, preimage))
+            except Exception as e:
+                print(f"[WARN] Could not withdraw Alice's HTLC: {e}")
+
+        # Create fresh HTLC for Bob — same tag=1 Waters key unlocks it
+        hashlock = 1
+        timelock = int(time.time()) + 3600
+        receipt = _send_tx(
+            _htlc.functions.newContract(_eth_acct.address, hashlock, timelock),
+            value=_w3.to_wei(0.01, 'ether')
+        )
+        if receipt['status'] != 1:
+            return jsonify({'error': 'newContract for recipient failed'}), 500
+
+        logs = _htlc.events.HTLCETHNew().process_receipt(receipt)
+        contract_id_hex = logs[0]['args']['contractId'].hex()
+        print(f"[REDELEGATE] Bob's HTLC created, contract_id={contract_id_hex}")
+        return jsonify({'contract_id': contract_id_hex})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/pay', methods=['POST'])
+def pay():
+    try:
+        _init_web3()
+        _ensure_setup()
+
+        contract_id_hex = request.json.get('contract_id', '')
+        if not contract_id_hex:
+            return jsonify({'error': 'contract_id missing — was this card created with blockchain enabled?'}), 400
+
+        print(f"[PAY] withdraw requested for contract_id={contract_id_hex}")
+        sol = json.loads(water_unlock_solidity(water_parameter, 1))
+        contract_id_bytes = bytes.fromhex(contract_id_hex.lstrip('0x'))
+
+        preimage = (_g1(sol['sk1']), _g1(sol['sk2']), _g2(sol['sk3']))
+        receipt_withdraw = _send_tx(_htlc.functions.withdraw(contract_id_bytes, preimage))
+        if receipt_withdraw['status'] != 1:
+            return jsonify({'error': 'withdraw failed on-chain'}), 500
+
+        return jsonify({
+            'tx_hash':     receipt_withdraw['transactionHash'].hex(),
+            'contract_id': contract_id_hex,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route("/api/verifyattest", methods=["GET"])
 def verifyattest():
