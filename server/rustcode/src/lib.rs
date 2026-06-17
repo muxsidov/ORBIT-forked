@@ -316,7 +316,7 @@ fn water_unlock_solidity(param_str: String, id: usize) -> PyResult<String>{
 }   
 
 #[pyfunction]
-fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_message_size: usize, MAX_ITEM: usize) -> PyResult<String> {
+fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_message_size: usize, MAX_ITEM: usize, tag: u8) -> PyResult<String> {
     let test = false;
     let param: ParamWaters = serde_json::from_str(&param).unwrap();
     let mut rng = ark_std::test_rng();
@@ -418,7 +418,6 @@ fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_
     }
 
     
-    let tag = 1; // NOTE: tag should be incrementally sampled/ randomly sampled instead
     let rand_m = ScalarField::rand(&mut rng);
     let rand_m_t = Bn254::pairing(g, g2)* rand_m; //some random message in the target group
     let mut hasher = Sha3_256::new();

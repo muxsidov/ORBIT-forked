@@ -91,6 +91,16 @@ def _ensure_setup():
     )
     _send_tx(_htlc.functions.setup(param_tuple))
     _htlc_setup_ok = True
+
+# Denomination → ETH amount mapping.  tag == hashlock == denom (integer).
+# To add a new denomination just add an entry here.
+_DENOM_ETH = {1: 0.01, 2: 0.02, 5: 0.05, 10: 0.10, 20: 0.20, 100: 1.00}
+
+def denomination_config(denom: int) -> dict:
+    """Return tag, hashlock, and ETH amount for a given denomination."""
+    if denom not in _DENOM_ETH:
+        raise ValueError(f"Unsupported denomination: {denom}. Supported: {list(_DENOM_ETH)}")
+    return {"tag": denom, "hashlock": denom, "eth": _DENOM_ETH[denom]}
 # ─────────────────────────────────────────────────────────────────────────
 from asn1crypto.core import Sequence
 from pyasn1.codec.ber import decoder as pyasn1decoder
@@ -137,7 +147,7 @@ def index():
 water_parameter = generate_params_waters()
 ecdsa_parameter = generate_params_ecdsa(water_parameter)
 
-def getpresig_fn(att_json):
+def getpresig_fn(att_json, tag=1):
     # att_json = json.loads((request.args.get('attestation')))
     is_valid_att, targetpk, nusecount = verify_attestation(att_json)
     assert nusecount==40 or nusecount==5 or nusecount==10, "Currently only support nUSE Count = 40/5, received:" +  str(nusecount)
@@ -166,7 +176,7 @@ def getpresig_fn(att_json):
                 ec.ECDH(), targetpk[i]
             )
             shared_key_arr.append(shared_key)
-    garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem)
+    garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag)
     # print("Obtained garble_msg")
     return garble_msg
 # TODO: merge with above / call the above function
@@ -206,26 +216,27 @@ def getpresig():
                 ec.ECDH(), targetpk[i]
             )
             shared_key_arr.append(shared_key)
-    garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem)
+    denomination = int(request.args.get('denomination', 1))
+    cfg = denomination_config(denomination)
+    garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, cfg["tag"])
 
     # Bank locks ETH in HTLC — this card now represents a redeemable coin
     contract_id_hex = ""
     try:
         _init_web3()
         _ensure_setup()
-        hashlock = 1
         timelock = int(time.time()) + 3600
         receipt_new = _send_tx(
-            _htlc.functions.newContract(_eth_acct.address, hashlock, timelock),
-            value=_w3.to_wei(0.01, 'ether')
+            _htlc.functions.newContract(_eth_acct.address, cfg["hashlock"], timelock),
+            value=_w3.to_wei(cfg["eth"], 'ether')
         )
         logs = _htlc.events.HTLCETHNew().process_receipt(receipt_new)
         contract_id_hex = logs[0]['args']['contractId'].hex()
-        print(f"[NEW] HTLC created, contract_id={contract_id_hex}")
+        print(f"[NEW] HTLC created, denomination={denomination}, contract_id={contract_id_hex}")
     except Exception as e:
         print(f"[WARN] HTLC newContract skipped: {e}")
 
-    return jsonify({"epk": urlsafe_b64encode(epk).decode("ascii"), "params": water_parameter, "msg": garble_msg, "contract_id": contract_id_hex})
+    return jsonify({"epk": urlsafe_b64encode(epk).decode("ascii"), "params": water_parameter, "msg": garble_msg, "contract_id": contract_id_hex, "denomination": denomination})
 
 def getpresigecdsa_fn(att_json):
     is_valid_att, targetpk, nusecount = verify_attestation(att_json)
@@ -328,30 +339,32 @@ def redelegate():
         _init_web3()
         _ensure_setup()
 
+        denomination = int(request.json.get('denomination', 1))
+        cfg = denomination_config(denomination)
+
         # Withdraw Alice's HTLC first to recover the locked ETH
         alice_contract_id_hex = request.json.get('contract_id', '')
         if alice_contract_id_hex:
             try:
-                sol = json.loads(water_unlock_solidity(water_parameter, 1))
+                sol = json.loads(water_unlock_solidity(water_parameter, denomination))
                 alice_contract_id_bytes = bytes.fromhex(alice_contract_id_hex.lstrip('0x'))
                 preimage = (_g1(sol['sk1']), _g1(sol['sk2']), _g2(sol['sk3']))
                 _send_tx(_htlc.functions.withdraw(alice_contract_id_bytes, preimage))
             except Exception as e:
                 print(f"[WARN] Could not withdraw Alice's HTLC: {e}")
 
-        # Create fresh HTLC for Bob — same tag=1 Waters key unlocks it
-        hashlock = 1
+        # Create fresh HTLC for Bob — same denomination Waters key unlocks it
         timelock = int(time.time()) + 3600
         receipt = _send_tx(
-            _htlc.functions.newContract(_eth_acct.address, hashlock, timelock),
-            value=_w3.to_wei(0.01, 'ether')
+            _htlc.functions.newContract(_eth_acct.address, cfg["hashlock"], timelock),
+            value=_w3.to_wei(cfg["eth"], 'ether')
         )
         if receipt['status'] != 1:
             return jsonify({'error': 'newContract for recipient failed'}), 500
 
         logs = _htlc.events.HTLCETHNew().process_receipt(receipt)
         contract_id_hex = logs[0]['args']['contractId'].hex()
-        print(f"[REDELEGATE] Bob's HTLC created, contract_id={contract_id_hex}")
+        print(f"[REDELEGATE] Bob's HTLC created, denomination={denomination}, contract_id={contract_id_hex}")
         return jsonify({'contract_id': contract_id_hex})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -366,8 +379,9 @@ def pay():
         if not contract_id_hex:
             return jsonify({'error': 'contract_id missing — was this card created with blockchain enabled?'}), 400
 
-        print(f"[PAY] withdraw requested for contract_id={contract_id_hex}")
-        sol = json.loads(water_unlock_solidity(water_parameter, 1))
+        denomination = int(request.json.get('denomination', 1))
+        print(f"[PAY] withdraw requested for contract_id={contract_id_hex}, denomination={denomination}")
+        sol = json.loads(water_unlock_solidity(water_parameter, denomination))
         contract_id_bytes = bytes.fromhex(contract_id_hex.lstrip('0x'))
 
         preimage = (_g1(sol['sk1']), _g1(sol['sk2']), _g2(sol['sk3']))
@@ -601,7 +615,7 @@ def test():
                 ec.ECDH(), targetpk[i]
             )
             shared_key_arr.append(shared_key)
-    garble_msg = garble_waters(parameter, shared_key_arr, nusecount, num_possible_item_per_elem)
+    garble_msg = garble_waters(parameter, shared_key_arr, nusecount, num_possible_item_per_elem, 1)
     # print("garble:", output)
     
     nusecount = 5
@@ -633,8 +647,8 @@ def test():
                 ec.ECDH(), targetpk[i]
             )
             shared_key_arr.append(shared_key)
-    garble_msg = garble_waters(parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem)
-    
+    garble_msg = garble_waters(parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, 1)
+
 def test_ecdsa_full():   
     # nusecount = 256
     # num_selectable_elem = nusecount
@@ -800,7 +814,7 @@ def test_dsign_rdelegate_native_pc():
                     if j==1:
                         target_shared_key_arr.append(shared_key)
                         message_pattern.append(1)
-            garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem)
+            garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, 1)
             start = time.time()
             ret = test_rdelegate_local(water_parameter, garble_msg, target_shared_key_arr, message_pattern,num_selectable_elem, num_possible_item_per_elem)
             exe_time.append( time.time() - start)
@@ -870,7 +884,7 @@ def test_redelegate_full():
                 target_shared_alice.append(sk)
                 message_pattern_alice.append(1)
 
-    alice_box = garble_waters(water_parameter, shared_key_arr_alice, nusecount, num_possible_item_per_elem)
+    alice_box = garble_waters(water_parameter, shared_key_arr_alice, nusecount, num_possible_item_per_elem, 1)
 
     # --- Step 2: Alice evaluates to recover (sk1, sk2, sk3) ---
     (sk1, sk2, sk3) = test_rdelegate_local(

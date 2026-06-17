@@ -23,7 +23,7 @@ Final: DSign(osk) → ECDSA signature → submit to zecdsa.sol → claims ETH
 ```
 Any holder of a valid `osk` — Alice or Bob after re-delegation — can claim this ETH. No per-user contract needed.
 
-> **Current implementation (Option A):** Re-delegate creates a fresh `zfairexchange.sol` HTLC for Bob using Alice's same Waters key (tag=1). Bob scans the QR and can Pay immediately. Option B (full paper crypto) would use `garble_redelegate()` to give Bob a cryptographically distinct key (tag=2) — see CLAUDE.md for details.
+> **Current implementation (Option A):** Re-delegate creates a fresh `zfairexchange.sol` HTLC for Bob at the same denomination, using Alice's same Waters key (`tag=denomination`). Bob scans the QR (which includes `denomination`) and can Pay immediately. Option B (full paper crypto) would use `garble_redelegate()` to give Bob a cryptographically distinct key at a new tag — see CLAUDE.md for details.
 
 ### Re-Delegation
 
@@ -50,13 +50,13 @@ The demo is working end-to-end on Sepolia testnet, including device-to-device re
 
 | Action | What happens |
 |--------|-------------|
-| **New** | Server garbles Waters circuit + locks 0.01 ETH in `zfairexchange.sol`. Card appears representing the locked ETH (contract_id shown top-right on the tile, "no HTLC" if blockchain was unavailable). |
-| **Pay** | App POSTs `{sk1,sk2,sk3,contract_id}` to server → `withdraw()` on Sepolia → TX hash shown → card removed. Recovers the 0.01 ETH. |
-| **Re-delegate** | Server withdraws Alice's HTLC (recovering her 0.01 ETH) and locks 0.01 ETH in a fresh HTLC for the recipient, then shows QR of `{sk1,sk2,sk3,contract_id}`. Card removed on dismiss. Net cost: gas only. |
-| **Scan** | Scans a QR from another device's Re-delegate. Adds a card with the scanned Waters key + contract_id, ready to Pay. |
+| **Mint FAB** | Tap the floating "Mint +" button (bottom-right). A dropdown appears with denomination options (1 C / 0.01 ETH, 2 C / 0.02 ETH, …). Server garbles Waters circuit with `tag=denomination` + locks the corresponding ETH in `zfairexchange.sol`. Card appears in the grid with gold coin art (1 or 2 coins) and the denomination label. |
+| **Pay** | App POSTs `{sk1,sk2,sk3,contract_id,denomination}` to server → `withdraw()` on Sepolia → TX hash shown → card removed. Recovers the locked ETH. |
+| **Re-delegate** | App POSTs `{sk1,sk2,sk3,contract_id,denomination}` to server → withdraws Alice's HTLC, locks same denomination ETH in a fresh HTLC for recipient → shows QR of `{sk1,sk2,sk3,contract_id,denomination}`. Card removed on dismiss. Net cost: gas only. |
+| **Scan** | Scans a QR from another device's Re-delegate. Adds a card with the scanned Waters key + contract_id + denomination, ready to Pay. |
 | **Long-press a tile** | Delete the card without paying (cleanup for cards with no HTLC). |
 
-**Gas costs (Sepolia):** ~0.0013 ETH for New, ~0.0025 for Re-delegate, ~0.0018 for Pay (`withdraw()` runs BN254 pairing on-chain, ~389k gas). A full New → Re-delegate → Pay cycle costs ~0.0056 ETH in gas; the locked 0.01 ETH always returns to the wallet.
+**Gas costs (Sepolia, observed):** ~0.002 ETH for New (first issuance also runs one-time `setup()`, ~+0.001 ETH), ~0.003 ETH for Re-delegate, ~0.005–0.006 ETH for Pay (`withdraw()` runs BN254 pairing on-chain, ~389k gas). A full New → Re-delegate → Pay cycle costs ~0.007 ETH in gas; the locked ETH always returns to the wallet. At 0.01 ETH lock (1-token), Pay nets roughly +0.004 ETH to the server wallet balance.
 
 **Troubleshooting:**
 - *Transactions time out ("not in the chain after N seconds")* — the wallet's nonce queue is likely jammed by stuck or mempool-evicted transactions. Run `server/unstick.py` (with env vars set) to replace stuck nonces with 0-ETH self-transfers.
