@@ -94,7 +94,7 @@ def _ensure_setup():
 
 # Denomination → ETH amount mapping.  tag == hashlock == denom (integer).
 # To add a new denomination just add an entry here.
-_DENOM_ETH = {1: 0.01, 2: 0.02, 5: 0.05, 10: 0.10, 20: 0.20, 100: 1.00}
+_DENOM_ETH = {1: 0.01, 2: 0.02, 5: 0.05, 10: 0.10, 20: 0.20, 50: 0.50, 100: 1.00}
 
 def denomination_config(denom: int) -> dict:
     """Return tag, hashlock, and ETH amount for a given denomination."""
