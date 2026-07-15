@@ -100,7 +100,7 @@ struct ParamECDSA {
 
 #[derive(Serialize,Deserialize)]
 struct PaymentBox {
-    tag: u8,
+    tag: String,
     rtag: Vec<Vec<u8>>,
     sig3: Vec<u8>,
     sig2: Vec<u8>,
@@ -111,7 +111,7 @@ struct PaymentBox {
 
 #[derive(Serialize,Deserialize)]
 struct ECDSABox {
-    tag: u8,
+    tag: String,
     rtag: Vec<Vec<u8>>,
     r: Vec<u8>,
     s0: Vec<u8>,
@@ -249,12 +249,18 @@ fn usize_to_fixed_bit_array_8(value: usize) -> [bool; 8] {
 }
 
 
-fn h_of_id(param: &ParamWaters, id: u8) -> G {
-    (0u8..8).filter(|i| (id >> i) & 1 == 1)
-        .fold(param.h_0, |acc, i| acc + param.h_vec[i as usize])
+fn h_of_id(param: &ParamWaters, id: &str) -> G {
+    id.bytes()
+        .enumerate()
+        .flat_map(|(byte_idx, byte)| {
+            (0u8..8)
+                .filter(move |bit| (byte >> bit) & 1 == 1)
+                .map(move |bit| byte_idx * 8 + bit as usize)
+        })
+        .fold(param.h_0, |acc, i| acc + param.h_vec[i])
 }
 
-fn water_encrypt(param: &ParamWaters, id: u8, message: pairing::PairingOutput<ark_ec::bn::Bn<ark_bn254::Config>>) -> Vec<Vec<u8>>{
+fn water_encrypt(param: &ParamWaters, id: &str, message: pairing::PairingOutput<ark_ec::bn::Bn<ark_bn254::Config>>) -> Vec<Vec<u8>>{
     let mut rng = ark_std::test_rng();
     let rand_t = ScalarField::rand(&mut rng);
     let c1 = Bn254::pairing(param.g_alpha, param.g2_beta)*rand_t + message;
@@ -316,7 +322,7 @@ fn water_unlock_solidity(param_str: String, id: usize) -> PyResult<String>{
 }   
 
 #[pyfunction]
-fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_message_size: usize, MAX_ITEM: usize, tag: u8) -> PyResult<String> {
+fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_message_size: usize, MAX_ITEM: usize, tag: String) -> PyResult<String> {
     let test = false;
     let param: ParamWaters = serde_json::from_str(&param).unwrap();
     let mut rng = ark_std::test_rng();
@@ -426,10 +432,10 @@ fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_
     for j in 0..32{
         aon_key_bytes[j] ^= hashed[j];
     }
-    let enc_rtag = water_encrypt(&param, tag, rand_m_t);
+    let enc_rtag = water_encrypt(&param, &tag, rand_m_t);
 
 
-    // encrypt sig1_vecs with chosen_keys. 
+    // encrypt sig1_vecs with chosen_keys.
     let mut enc_sig1_vec = Vec::new();
     let mut key_mat_vec: Vec<Vec<u8>> = Vec::new();
     for i in 0..garble_message_size{
@@ -488,7 +494,7 @@ fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_
 // osk_sk1/sk2/sk3 are Alice's recovered key bytes (proof of delegation authority).
 // tag2 is the identity for Bob's new key — must differ from Alice's tag to prevent reuse.
 #[pyfunction]
-fn garble_redelegate(param_str: String, osk_sk1: Vec<u8>, osk_sk2: Vec<u8>, osk_sk3: Vec<u8>, shared_key_list: &'_ Bound<'_, PyList>, garble_message_size: usize, MAX_ITEM: usize, tag2: u8) -> PyResult<String> {
+fn garble_redelegate(param_str: String, osk_sk1: Vec<u8>, osk_sk2: Vec<u8>, osk_sk3: Vec<u8>, shared_key_list: &'_ Bound<'_, PyList>, garble_message_size: usize, MAX_ITEM: usize, tag2: String) -> PyResult<String> {
     let param: ParamWaters = serde_json::from_str(&param_str).unwrap();
     let mut rng = ark_std::test_rng();
     let g = param.g;
@@ -557,7 +563,7 @@ fn garble_redelegate(param_str: String, osk_sk1: Vec<u8>, osk_sk2: Vec<u8>, osk_
     hasher.update(rand_m_t.to_string());
     let hashed = hasher.finalize().to_vec();
     for j in 0..32 { aon_key_bytes[j] ^= hashed[j]; }
-    let enc_rtag = water_encrypt(&param, tag2, rand_m_t);
+    let enc_rtag = water_encrypt(&param, &tag2, rand_m_t);
 
     let mut enc_sig1_vec = Vec::new();
     let mut key_mat_vec: Vec<Vec<u8>> = Vec::new();
@@ -587,7 +593,7 @@ fn garble_redelegate(param_str: String, osk_sk1: Vec<u8>, osk_sk2: Vec<u8>, osk_
     let enc_sig3 = encrypt(&sig_3_byte[..], &aon_key_bytes, 3);
 
     let pay_box = PaymentBox {
-        tag: tag2,
+        tag: tag2.clone(),
         rtag: enc_rtag,
         sig3: enc_sig3,
         sig2: enc_sig2,
@@ -780,7 +786,7 @@ fn garble_ecdsa(param: String, shared_key_list:  &'_ Bound<'_, PyList>, num_sele
         }
     }
 
-    let tag = 1; // NOTE: tag should be incrementally sampled/ randomly sampled instead
+    let tag = "001_000".to_string(); // ECDSA variant placeholder tag
     let rand_m = ScalarField::rand(&mut rng);
     let rand_m_t = Bn254::pairing(param.param_water.g, param.param_water.g2)* rand_m; //some random message in the target group
     let mut hasher = Sha3_256::new();
@@ -789,7 +795,7 @@ fn garble_ecdsa(param: String, shared_key_list:  &'_ Bound<'_, PyList>, num_sele
     for j in 0..32{
         aon_key_bytes[j] ^= hashed[j];
     }
-    let enc_rtag = water_encrypt(&param.param_water, tag, rand_m_t);
+    let enc_rtag = water_encrypt(&param.param_water, &tag, rand_m_t);
 
     // encrypt sig1_vecs with chosen_keys. 
     let mut enc_sig1_vec = Vec::new();
@@ -826,7 +832,7 @@ fn garble_ecdsa(param: String, shared_key_list:  &'_ Bound<'_, PyList>, num_sele
     let enc_r = encrypt(&r_byte[..], &aon_key_bytes,2);
 
     let ecdsa_box = ECDSABox {
-        tag: tag,
+        tag: tag.clone(),
         rtag: enc_rtag,
         r: enc_r,
         s0: enc_sig0,

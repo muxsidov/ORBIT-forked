@@ -92,15 +92,24 @@ def _ensure_setup():
     _send_tx(_htlc.functions.setup(param_tuple))
     _htlc_setup_ok = True
 
-# Denomination → ETH amount mapping.  tag == hashlock == denom (integer).
+# Denomination → ETH amount mapping.
 # To add a new denomination just add an entry here.
 _DENOM_ETH = {1: 0.01, 2: 0.02, 5: 0.05, 10: 0.10, 20: 0.20, 50: 0.50, 100: 1.00}
 
-def denomination_config(denom: int) -> dict:
+# User registry: persists for the lifetime of the server process.
+# Maps user_id (int) → {"pubkeys": [bytes, ...], "nusecount": int}
+_user_registry: dict = {}
+_next_user_id: int = 1
+
+def make_tag(denom: int, user_id: int) -> str:
+    """Format a Waters IBE tag as 'DDD_UUU' (3-digit denomination, 3-digit user_id)."""
+    return f"{denom:03d}_{user_id:03d}"
+
+def denomination_config(denom: int, user_id: int = 0) -> dict:
     """Return tag, hashlock, and ETH amount for a given denomination."""
     if denom not in _DENOM_ETH:
         raise ValueError(f"Unsupported denomination: {denom}. Supported: {list(_DENOM_ETH)}")
-    return {"tag": denom, "hashlock": denom, "eth": _DENOM_ETH[denom]}
+    return {"tag": make_tag(denom, user_id), "hashlock": denom, "eth": _DENOM_ETH[denom]}
 # ─────────────────────────────────────────────────────────────────────────
 from asn1crypto.core import Sequence
 from pyasn1.codec.ber import decoder as pyasn1decoder
@@ -147,7 +156,7 @@ def index():
 water_parameter = generate_params_waters()
 ecdsa_parameter = generate_params_ecdsa(water_parameter)
 
-def getpresig_fn(att_json, tag=1):
+def getpresig_fn(att_json, tag="001_000"):
     # att_json = json.loads((request.args.get('attestation')))
     is_valid_att, targetpk, nusecount = verify_attestation(att_json)
     assert nusecount==40 or nusecount==5 or nusecount==10, "Currently only support nUSE Count = 40/5, received:" +  str(nusecount)
@@ -402,6 +411,24 @@ def verifyattest():
     is_valid_att, targetpk, nusecount = verify_attestation(json.loads(request.args.get('attestation'))["att"])
     return jsonify({"status": "ok"})
 
+@app.route("/api/register", methods=["GET"])
+def register_user():
+    global _next_user_id
+    att_json = json.loads(request.args.get('attestation'))
+    _is_valid, targetpk, nusecount = verify_attestation(att_json["att"])
+
+    user_id = _next_user_id
+    _next_user_id += 1
+
+    pubkeys_b64 = [
+        base64.urlsafe_b64encode(pk.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)).decode()
+        for pk in targetpk
+    ]
+    _user_registry[user_id] = {"pubkeys": pubkeys_b64, "nusecount": nusecount}
+
+    print(f"[REGISTER] user_id={user_id} nusecount={nusecount}")
+    return jsonify({"user_id": user_id, "pubkeys": pubkeys_b64})
+
 def verify_attestation(att):
     cert_arr = []
     cert_raw_arr =[]
@@ -615,7 +642,7 @@ def test():
                 ec.ECDH(), targetpk[i]
             )
             shared_key_arr.append(shared_key)
-    garble_msg = garble_waters(parameter, shared_key_arr, nusecount, num_possible_item_per_elem, 1)
+    garble_msg = garble_waters(parameter, shared_key_arr, nusecount, num_possible_item_per_elem, make_tag(1, 0))
     # print("garble:", output)
     
     nusecount = 5
@@ -647,7 +674,7 @@ def test():
                 ec.ECDH(), targetpk[i]
             )
             shared_key_arr.append(shared_key)
-    garble_msg = garble_waters(parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, 1)
+    garble_msg = garble_waters(parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, make_tag(1, 0))
 
 def test_ecdsa_full():   
     # nusecount = 256
@@ -814,7 +841,7 @@ def test_dsign_rdelegate_native_pc():
                     if j==1:
                         target_shared_key_arr.append(shared_key)
                         message_pattern.append(1)
-            garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, 1)
+            garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, make_tag(1, 0))
             start = time.time()
             ret = test_rdelegate_local(water_parameter, garble_msg, target_shared_key_arr, message_pattern,num_selectable_elem, num_possible_item_per_elem)
             exe_time.append( time.time() - start)
@@ -884,7 +911,7 @@ def test_redelegate_full():
                 target_shared_alice.append(sk)
                 message_pattern_alice.append(1)
 
-    alice_box = garble_waters(water_parameter, shared_key_arr_alice, nusecount, num_possible_item_per_elem, 1)
+    alice_box = garble_waters(water_parameter, shared_key_arr_alice, nusecount, num_possible_item_per_elem, make_tag(1, 0))
 
     # --- Step 2: Alice evaluates to recover (sk1, sk2, sk3) ---
     (sk1, sk2, sk3) = test_rdelegate_local(
@@ -911,7 +938,7 @@ def test_redelegate_full():
 
     bob_box = garble_redelegate(
         water_parameter, sk1, sk2, sk3,
-        shared_key_arr_bob, nusecount, num_possible_item_per_elem, 2  # tag2 = 2
+        shared_key_arr_bob, nusecount, num_possible_item_per_elem, make_tag(1, 1)  # denom=1, bob=user 001
     )
     print("Alice garbled Bob's circuit")
 
