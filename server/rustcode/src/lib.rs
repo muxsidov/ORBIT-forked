@@ -524,6 +524,69 @@ fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_
     Ok(json_string)
 }
 
+// Generate a GS circuit: a linear garbled binary circuit that evaluates to the Waters
+// activation key for any tag provided at re-delegation time.  Called by the server alongside
+// garble_waters so Alice can re-delegate offline without needing beta_secret.
+//
+// gs_shared_key_list: 1 branch key + TAG_BITS*2 bit-slot keys (bit=0 key, bit=1 key per bit).
+// Output JSON: {base_enc, slots_c0, slots_c1} — Alice's device adds the epk separately.
+//
+// Evaluation (Android JNI evaluate_gs):
+//   dk1 = Decrypt(base_enc) + Σ Decrypt(slots_c{btag_i}[i])   (G1 addition)
+//   dk2, dk3 = from base_enc
+#[pyfunction]
+fn generate_gs(
+    param_str: String,
+    gs_shared_key_list: &'_ Bound<'_, PyList>,
+    tag_bits: usize,
+) -> PyResult<String> {
+    let param: ParamWaters = serde_json::from_str(&param_str).unwrap();
+    let mut rng = ark_std::test_rng();
+
+    let rand_r = ScalarField::rand(&mut rng);
+    let msk = param.g_alpha * param.beta_secret;
+    let base_dk1 = msk + (param.h_0 * rand_r);
+    let dk2 = param.g * rand_r;
+    let dk3 = param.g2 * rand_r;
+
+    let mut base_dk1_bytes = Vec::new();
+    base_dk1.serialize_compressed(&mut base_dk1_bytes).unwrap();
+    let mut dk2_bytes = Vec::new();
+    dk2.serialize_compressed(&mut dk2_bytes).unwrap();
+    let mut dk3_bytes = Vec::new();
+    dk3.serialize_compressed(&mut dk3_bytes).unwrap();
+    // base_plaintext = base_dk1 (32B) || dk2 (32B) || dk3 (64B) = 128 bytes
+    let base_plaintext: Vec<u8> = [base_dk1_bytes.as_slice(), dk2_bytes.as_slice(), dk3_bytes.as_slice()].concat();
+
+    let shared_keys: Vec<Vec<u8>> = gs_shared_key_list
+        .iter()
+        .map(|item| item.downcast::<PyBytes>().unwrap().as_bytes().to_vec())
+        .collect();
+    assert_eq!(shared_keys.len(), 1 + tag_bits * 2, "GS shared_keys count mismatch");
+
+    let base_enc = encrypt(&base_plaintext, &shared_keys[0], 0);
+
+    let mut zero_g1_bytes = Vec::new();
+    G::zero().serialize_compressed(&mut zero_g1_bytes).unwrap();
+
+    let mut slots_c0: Vec<String> = Vec::new();
+    let mut slots_c1: Vec<String> = Vec::new();
+    for i in 0..tag_bits {
+        let delta_i = param.h_vec[i] * rand_r;
+        let mut delta_i_bytes = Vec::new();
+        delta_i.serialize_compressed(&mut delta_i_bytes).unwrap();
+
+        slots_c0.push(hex::encode(encrypt(&zero_g1_bytes, &shared_keys[1 + 2 * i], 0)));
+        slots_c1.push(hex::encode(encrypt(&delta_i_bytes, &shared_keys[1 + 2 * i + 1], 0)));
+    }
+
+    Ok(json!({
+        "base_enc": hex::encode(base_enc),
+        "slots_c0": slots_c0,
+        "slots_c1": slots_c1,
+    }).to_string())
+}
+
 // Alice runs this on her device to garble a Waters activation key for Bob without the server.
 // osk_sk1/sk2/sk3 are Alice's recovered key bytes (proof of delegation authority).
 // tag2 is the identity for Bob's new key — must differ from Alice's tag to prevent reuse.
@@ -1252,6 +1315,7 @@ fn rustcode(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_params_ecdsa, m)?)?;
     m.add_function(wrap_pyfunction!(water_unlock_solidity, m)?)?;
     m.add_function(wrap_pyfunction!(water_derive_ak, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_gs, m)?)?;
     m.add_function(wrap_pyfunction!(garble_waters, m)?)?;
     m.add_function(wrap_pyfunction!(garble_redelegate, m)?)?;
     m.add_function(wrap_pyfunction!(garble_ecdsa, m)?)?;

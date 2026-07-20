@@ -10,7 +10,7 @@ import sys, os
 from base64 import urlsafe_b64encode, urlsafe_b64decode
 from flask import Flask, session, request, redirect, abort, jsonify
 
-from rustcode import test_water, test_ecdsa, test_activate, test_unlock, test_dsign_local, test_rdelegate_local, garble_waters, garble_redelegate, garble_ecdsa, generate_params_waters,generate_params_ecdsa, test_encrypt, water_unlock_solidity, water_derive_ak
+from rustcode import test_water, test_ecdsa, test_activate, test_unlock, test_dsign_local, test_rdelegate_local, garble_waters, garble_redelegate, garble_ecdsa, generate_params_waters,generate_params_ecdsa, test_encrypt, water_unlock_solidity, water_derive_ak, generate_gs
 # poseidon
 
 import os
@@ -156,78 +156,90 @@ def index():
 water_parameter = generate_params_waters()
 ecdsa_parameter = generate_params_ecdsa(water_parameter)
 
+_GS_TAG_BITS = 56  # 7 bytes × 8 bits for "DDD_UUU" tag format
+
 def getpresig_fn(att_json, tag="001_000"):
     # att_json = json.loads((request.args.get('attestation')))
     is_valid_att, targetpk, nusecount = verify_attestation(att_json)
-    assert nusecount==40 or nusecount==5 or nusecount==10, "Currently only support nUSE Count = 40/5, received:" +  str(nusecount)
-    num_selectable_elem = nusecount
+    assert nusecount==40 or nusecount==5 or nusecount==10 or nusecount==64, "Currently only support nUSE Count = 40/5/10/64, received:" +  str(nusecount)
+    # nusecount==64: GWat uses 5 positions (same as nusecount==5), GS uses remaining 57 slots
     if nusecount==40:
-        num_possible_item_per_elem = 2 #Bit version is 2, byte version is 256
+        num_selectable_elem = 40
+        num_possible_item_per_elem = 2
     elif nusecount==10:
+        num_selectable_elem = 10
         num_possible_item_per_elem = 16
-    else:
+    else:  # nusecount==5 or nusecount==64
+        num_selectable_elem = 5
         num_possible_item_per_elem = 256
-    # 2^40 = 1 trillion unique boxes
     if not is_valid_att:
         return None
-    targetpk = [targetpk]*num_selectable_elem #Assuming n-Use-Key
+    raw_pk = targetpk
 
     epk=b""
     shared_key_arr = []
-    for i in range(num_selectable_elem):
+    for _ in range(num_selectable_elem):
         for _ in range(num_possible_item_per_elem):
-            # Sha256
-            private_key = ec.generate_private_key(
-                ec.SECP256R1()
-            )
+            private_key = ec.generate_private_key(ec.SECP256R1())
             epk += private_key.public_key().public_bytes(Encoding.X962,PublicFormat.CompressedPoint)
-            shared_key = private_key.exchange(
-                ec.ECDH(), targetpk[i]
-            )
-            shared_key_arr.append(shared_key)
+            shared_key_arr.append(private_key.exchange(ec.ECDH(), raw_pk))
     garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag)
-    # print("Obtained garble_msg")
-    return garble_msg
+
+    gs_circuit = None
+    if nusecount == 64:
+        gs_epk = b""
+        gs_shared_keys = []
+        for _ in range(1 + _GS_TAG_BITS * 2):
+            priv = ec.generate_private_key(ec.SECP256R1())
+            gs_epk += priv.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+            gs_shared_keys.append(priv.exchange(ec.ECDH(), raw_pk))
+        gs_json = json.loads(generate_gs(water_parameter, gs_shared_keys, _GS_TAG_BITS))
+        gs_json["epk"] = urlsafe_b64encode(gs_epk).decode("ascii")
+        gs_circuit = gs_json
+
+    return garble_msg, epk, gs_circuit
 # TODO: merge with above / call the above function
 @app.route("/api/delegatedpresig", methods=["GET"])
 def getpresig():
     att_json = json.loads((request.args.get('attestation')))
     is_valid_att, targetpk, nusecount = verify_attestation(json.loads(request.args.get('attestation'))["att"])
-    assert nusecount==40 or nusecount==5 or nusecount==10, "Currently only support nUSE Count = 40/5, received:" +  str(nusecount)
-    num_selectable_elem = nusecount
+    assert nusecount==40 or nusecount==5 or nusecount==10 or nusecount==64, "Currently only support nUSE Count = 40/5/10/64, received:" +  str(nusecount)
     if nusecount==40:
-        num_possible_item_per_elem = 2 #Bit version is 2, byte version is 256
+        num_selectable_elem = 40
+        num_possible_item_per_elem = 2
     elif nusecount==10:
+        num_selectable_elem = 10
         num_possible_item_per_elem = 16
-    else:
+    else:  # nusecount==5 or nusecount==64
+        num_selectable_elem = 5
         num_possible_item_per_elem = 256
-    
-    # 2^40 = 1 trillion unique boxes
-    
+
     if not is_valid_att:
         return jsonify("NONE")
-    targetpk = [targetpk]*num_selectable_elem #Assuming n-Use-Key
-    
-    # # If byte (8) is set, then nUSE count should be 256/8
-    # capability = get_delegated_signing_capability_wordbased(ajson, origin, targetpk, int(256/nusecount) ) if nusecount!=256 else get_delegated_signing_capability(ajson, origin, targetpk)
-    # return jsonify(credentials_userprofile)
+    raw_pk = targetpk
 
     epk=b""
     shared_key_arr = []
-    for i in range(num_selectable_elem):
+    for _ in range(num_selectable_elem):
         for _ in range(num_possible_item_per_elem):
-            # Sha256
-            private_key = ec.generate_private_key(
-                ec.SECP256R1()
-            )
+            private_key = ec.generate_private_key(ec.SECP256R1())
             epk += private_key.public_key().public_bytes(Encoding.X962,PublicFormat.CompressedPoint)
-            shared_key = private_key.exchange(
-                ec.ECDH(), targetpk[i]
-            )
-            shared_key_arr.append(shared_key)
+            shared_key_arr.append(private_key.exchange(ec.ECDH(), raw_pk))
     denomination = int(request.args.get('denomination', 1))
     cfg = denomination_config(denomination)
     garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, cfg["tag"])
+
+    gs_circuit = None
+    if nusecount == 64:
+        gs_epk = b""
+        gs_shared_keys = []
+        for _ in range(1 + _GS_TAG_BITS * 2):
+            priv = ec.generate_private_key(ec.SECP256R1())
+            gs_epk += priv.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+            gs_shared_keys.append(priv.exchange(ec.ECDH(), raw_pk))
+        gs_json = json.loads(generate_gs(water_parameter, gs_shared_keys, _GS_TAG_BITS))
+        gs_json["epk"] = urlsafe_b64encode(gs_epk).decode("ascii")
+        gs_circuit = gs_json
 
     # Bank locks ETH in HTLC — this card now represents a redeemable coin
     contract_id_hex = ""
@@ -245,7 +257,10 @@ def getpresig():
     except Exception as e:
         print(f"[WARN] HTLC newContract skipped: {e}")
 
-    return jsonify({"epk": urlsafe_b64encode(epk).decode("ascii"), "params": water_parameter, "msg": garble_msg, "contract_id": contract_id_hex, "denomination": denomination})
+    resp = {"epk": urlsafe_b64encode(epk).decode("ascii"), "params": water_parameter, "msg": garble_msg, "contract_id": contract_id_hex, "denomination": denomination}
+    if gs_circuit is not None:
+        resp["gs_circuit"] = gs_circuit
+    return jsonify(resp)
 
 def getpresigecdsa_fn(att_json):
     is_valid_att, targetpk, nusecount = verify_attestation(att_json)
