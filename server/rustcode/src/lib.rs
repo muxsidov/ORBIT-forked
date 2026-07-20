@@ -319,7 +319,41 @@ fn water_unlock_solidity(param_str: String, id: usize) -> PyResult<String>{
     merge_json(&mut ret, &g1_vec_to_uncompressed_json(param.h_vec[..40].to_vec(), "u_vec"));
 
     Ok(ret.to_string())
-}   
+}
+
+// Derive a fresh Waters activation key (ak2) for a string tag using the master secret.
+// Returns {"sk1":"<hex>","sk2":"<hex>","sk3":"<hex>"} in compressed form (same format
+// as evaluate_paymentbox output so the Android app can store it directly as a card).
+#[pyfunction]
+fn water_derive_ak(param_str: String, tag: String) -> PyResult<String> {
+    let param: ParamWaters = serde_json::from_str(&param_str).unwrap();
+    let mut rng = ark_std::test_rng();
+
+    let rand_r = ScalarField::rand(&mut rng);
+    let h_tag = h_of_id(&param, &tag);
+
+    let sk1 = (param.g_alpha * param.beta_secret) + (h_tag * rand_r);
+    let sk2 = param.g * rand_r;
+    let sk3 = param.g2 * rand_r;
+
+    let lhs = Bn254::pairing(param.g_alpha, param.g2_beta) + Bn254::pairing(h_tag, sk3);
+    let rhs = Bn254::pairing(sk1, param.g2);
+    assert_eq!(lhs, rhs, "water_derive_ak: pairing check 1 failed");
+    assert_eq!(Bn254::pairing(sk2, param.g2), Bn254::pairing(param.g, sk3), "water_derive_ak: pairing check 2 failed");
+
+    let mut sk1_bytes = Vec::new();
+    sk1.serialize_compressed(&mut sk1_bytes).unwrap();
+    let mut sk2_bytes = Vec::new();
+    sk2.serialize_compressed(&mut sk2_bytes).unwrap();
+    let mut sk3_bytes = Vec::new();
+    sk3.serialize_compressed(&mut sk3_bytes).unwrap();
+
+    let sk1_hex: String = sk1_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let sk2_hex: String = sk2_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let sk3_hex: String = sk3_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    Ok(format!("{{\"sk1\":\"{}\",\"sk2\":\"{}\",\"sk3\":\"{}\"}}", sk1_hex, sk2_hex, sk3_hex))
+}
 
 #[pyfunction]
 fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_message_size: usize, MAX_ITEM: usize, tag: String) -> PyResult<String> {
@@ -1217,6 +1251,7 @@ fn rustcode(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_params_waters, m)?)?;
     m.add_function(wrap_pyfunction!(generate_params_ecdsa, m)?)?;
     m.add_function(wrap_pyfunction!(water_unlock_solidity, m)?)?;
+    m.add_function(wrap_pyfunction!(water_derive_ak, m)?)?;
     m.add_function(wrap_pyfunction!(garble_waters, m)?)?;
     m.add_function(wrap_pyfunction!(garble_redelegate, m)?)?;
     m.add_function(wrap_pyfunction!(garble_ecdsa, m)?)?;

@@ -10,7 +10,7 @@ import sys, os
 from base64 import urlsafe_b64encode, urlsafe_b64decode
 from flask import Flask, session, request, redirect, abort, jsonify
 
-from rustcode import test_water, test_ecdsa, test_activate, test_unlock, test_dsign_local, test_rdelegate_local, garble_waters, garble_redelegate, garble_ecdsa, generate_params_waters,generate_params_ecdsa, test_encrypt, water_unlock_solidity
+from rustcode import test_water, test_ecdsa, test_activate, test_unlock, test_dsign_local, test_rdelegate_local, garble_waters, garble_redelegate, garble_ecdsa, generate_params_waters,generate_params_ecdsa, test_encrypt, water_unlock_solidity, water_derive_ak
 # poseidon
 
 import os
@@ -338,17 +338,21 @@ def waters_solidity_params():
 
 @app.route('/api/redelegate', methods=['POST'])
 def redelegate():
-    """Withdraw Alice's HTLC (recovering her ETH), then create a fresh HTLC for Bob.
+    """Withdraw Alice's HTLC, derive ak2 for Bob's tag, create Bob's HTLC.
 
-    Option A shortcut: the same tag=1 Waters key unlocks both Alice's and Bob's HTLC.
-    Option B (future): garble_redelegate() would derive a new key for tag=2 so Alice
-    and Bob have cryptographically distinct keys — see CLAUDE.md Possible Next Steps.
+    Body: {sk1, sk2, sk3, contract_id, denomination, bob_tag}
+    Returns: {ak2: {sk1, sk2, sk3}, contract_id}
+    The server uses beta_secret to derive a fresh Waters key for bob_tag.
+    Alice puts ak2 in a QR; Bob evaluates his stored DK2 with it to get osk2.
     """
     try:
         _init_web3()
         _ensure_setup()
 
         denomination = int(request.json.get('denomination', 1))
+        bob_tag = request.json.get('bob_tag', '')
+        if not bob_tag:
+            return jsonify({'error': 'bob_tag required'}), 400
         cfg = denomination_config(denomination)
 
         # Withdraw Alice's HTLC first to recover the locked ETH
@@ -362,21 +366,33 @@ def redelegate():
             except Exception as e:
                 print(f"[WARN] Could not withdraw Alice's HTLC: {e}")
 
-        # Create fresh HTLC for Bob — same denomination Waters key unlocks it
+        # Derive ak2 = fresh Waters key for Bob's tag (uses beta_secret server-side)
+        ak2 = json.loads(water_derive_ak(water_parameter, bob_tag))
+
+        # Create Bob's HTLC — locked with Bob's tag as hashlock
+        bob_cfg = denomination_config(denomination, _user_id_from_tag(bob_tag))
         timelock = int(time.time()) + 3600
         receipt = _send_tx(
-            _htlc.functions.newContract(_eth_acct.address, cfg["hashlock"], timelock),
-            value=_w3.to_wei(cfg["eth"], 'ether')
+            _htlc.functions.newContract(_eth_acct.address, bob_cfg["hashlock"], timelock),
+            value=_w3.to_wei(bob_cfg["eth"], 'ether')
         )
         if receipt['status'] != 1:
-            return jsonify({'error': 'newContract for recipient failed'}), 500
+            return jsonify({'error': 'newContract for Bob failed'}), 500
 
         logs = _htlc.events.HTLCETHNew().process_receipt(receipt)
         contract_id_hex = logs[0]['args']['contractId'].hex()
-        print(f"[REDELEGATE] Bob's HTLC created, denomination={denomination}, contract_id={contract_id_hex}")
-        return jsonify({'contract_id': contract_id_hex})
+        print(f"[REDELEGATE] bob_tag={bob_tag}, contract_id={contract_id_hex}")
+        return jsonify({'ak2': ak2, 'contract_id': contract_id_hex})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+def _user_id_from_tag(tag: str) -> int:
+    """Extract user_id from a 'DDD_UUU' tag string."""
+    try:
+        return int(tag.split('_')[1])
+    except (IndexError, ValueError):
+        return 0
 
 @app.route('/api/pay', methods=['POST'])
 def pay():
