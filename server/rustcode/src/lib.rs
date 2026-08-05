@@ -1299,6 +1299,39 @@ fn test_pairing() -> PyResult<String> {
 //     Ok(ret_str)    
 // }
 
+#[pyfunction]
+fn decompress_waters_key(sk1_hex: &str, sk2_hex: &str, sk3_hex: &str) -> PyResult<String> {
+    use ark_bn254::{G1Affine, G2Affine};
+    use ark_serialize::CanonicalDeserialize;
+
+    let sk1_bytes = hex::decode(sk1_hex)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+    let sk2_bytes = hex::decode(sk2_hex)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+    let sk3_bytes = hex::decode(sk3_hex)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+    let sk1 = G1Affine::deserialize_compressed(&*sk1_bytes)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+    let sk2 = G1Affine::deserialize_compressed(&*sk2_bytes)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+    let sk3 = G2Affine::deserialize_compressed(&*sk3_bytes)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+    let sk1_x = sk1.x.into_bigint().to_string();
+    let sk1_y = sk1.y.into_bigint().to_string();
+    let sk2_x = sk2.x.into_bigint().to_string();
+    let sk2_y = sk2.y.into_bigint().to_string();
+    let sk3_x_c0 = sk3.x.c0.into_bigint().to_string();
+    let sk3_x_c1 = sk3.x.c1.into_bigint().to_string();
+    let sk3_y_c0 = sk3.y.c0.into_bigint().to_string();
+    let sk3_y_c1 = sk3.y.c1.into_bigint().to_string();
+
+    Ok(format!(
+        r#"{{"sk1":{{"x":"{sk1_x}","y":"{sk1_y}"}},"sk2":{{"x":"{sk2_x}","y":"{sk2_y}"}},"sk3":{{"x":["{sk3_x_c0}","{sk3_x_c1}"],"y":["{sk3_y_c0}","{sk3_y_c1}"]}}}}"#
+    ))
+}
+
 #[pymodule]
 fn rustcode(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_log::init();
@@ -1316,6 +1349,7 @@ fn rustcode(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(water_unlock_solidity, m)?)?;
     m.add_function(wrap_pyfunction!(water_derive_ak, m)?)?;
     m.add_function(wrap_pyfunction!(generate_gs, m)?)?;
+    m.add_function(wrap_pyfunction!(decompress_waters_key, m)?)?;
     m.add_function(wrap_pyfunction!(garble_waters, m)?)?;
     m.add_function(wrap_pyfunction!(garble_redelegate, m)?)?;
     m.add_function(wrap_pyfunction!(garble_ecdsa, m)?)?;

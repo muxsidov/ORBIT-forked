@@ -8,7 +8,7 @@ ORBIT is an academic research prototype for a **one-shot payment system** using 
 
 - **Issuance (offline prep)**: Bank issues a dormant key (dmk) — a garbled Waters IBE circuit — to Alice. The circuit is useless without evaluation.
 - **Activation (requires server)**: Alice evaluates the circuit using her AndroidKeyStore private key via ECDH → recovers `(sk1, sk2, sk3)`, her Waters activation key. The dmk is now live and stored as a card.
-- **Use (fully offline)**: Alice uses the dmk exactly once — either **Pay** (demo: log + remove card) or **Re-delegate** (offline: garble a new circuit for a recipient using stored `params` + `(sk1, sk2, sk3)`). Either action removes the card, enforcing one-timeness.
+- **Use (fully offline)**: Alice uses the dmk exactly once — either **Withdraw** (submits Waters key to Sepolia, claims ETH) or **Re-delegate** (offline: re-evaluates GS circuit at Bob's tag bits using AndroidKeyStore ECDH, produces ak2 QR). Either action removes the card, enforcing one-timeness.
 
 Two variants exist in the codebase:
 - **Waters/RDelegate** — the main demo path; supports both Pay and Re-delegate from a single dmk
@@ -35,10 +35,10 @@ bash build.sh   # runs: cd rustcode && maturin develop --release
 ```
 
 Key endpoints:
-- `GET /api/delegatedpresig?attestation=...&denomination=N` — verifies Android attestation, garbles Waters circuit with `tag=N`, calls `newContract()` on Sepolia (locks ETH per `_DENOM_ETH[N]`), returns `{epk, params, msg, contract_id, denomination}`. `denomination` defaults to 1.
+- `GET /api/delegatedpresig?attestation=...&denomination=N` — verifies Android attestation (nusecount=64 required), garbles Waters circuit with `tag=N`, generates GS circuit (57 ECDH slots for offline re-delegation), calls `newContract()` on Sepolia, returns `{epk, params, msg, contract_id, denomination, gs_circuit}`. `denomination` defaults to 1.
 - `GET /api/delegatedpresigecdsa?attestation=...` — same but ECDSA variant (no blockchain call, no denomination)
 - `POST /api/pay` — body `{sk1, sk2, sk3, contract_id, denomination}` — calls `withdraw()` on `zfairexchange.sol` using the correct `hashlock=denomination`, returns `{tx_hash, contract_id}`
-- `POST /api/redelegate` — body `{sk1, sk2, sk3, contract_id, denomination}` — withdraws Alice's HTLC, then `newContract()` creates a fresh HTLC for Bob at the same denomination's ETH amount, returns Bob's `contract_id`. If Alice's `contract_id` is empty, the withdraw is skipped gracefully.
+- `POST /api/redelegate` — body `{contract_id, denomination}` — withdraws Alice's HTLC (skipped gracefully if `contract_id` is empty), then `newContract()` creates a fresh HTLC for Bob at the same denomination's ETH amount, returns `{contract_id}` for Bob. sk1/sk2/sk3 NOT required — server derives Waters key from its own beta_secret for on-chain use.
 - `GET /api/waters_solidity_params?id=<int>` — returns Waters params + signing key for given id in Solidity-compatible format; used by `ztest_htlc.ipynb`
 - `GET /api/benchmarkdelegateecdsa?attestation=...` — runs 100 server-side benchmark iterations (heavy — avoid during normal use)
 - `GET /api/verifyattest?attestation=...` — standalone attestation verification
@@ -64,6 +64,8 @@ def denomination_config(denom: int) -> dict:
 - Gas price is **2x current** — bidding exactly the going rate leaves txs stuck in the mempool during Sepolia gas spikes.
 - Receipt timeout is **300s** (web3 default 120s was too short during congestion).
 - Server console logs: `[NEW]`, `[REDELEGATE]`, `[PAY]` lines print the `contract_id` for each on-chain action; `[WARN]` lines show skipped/failed calls.
+
+**`contract_id` hex stripping:** `server.py` uses `contract_id_hex.removeprefix('0x')` (Python 3.9+) before calling `bytes.fromhex()`. Do NOT use `str.lstrip('0x')` — it strips all leading `'0'` and `'x'` characters (not just the two-char prefix), so a contract_id like `0f9a...` loses its leading zero, producing a 63-char odd-length hex string that causes `ValueError: non-hexadecimal number found` in `bytes.fromhex()`.
 
 **Stuck nonce queue:** If txs time out with "is not in the chain after N seconds", check for a nonce jam: compare `get_transaction_count(addr, 'latest')` vs `'pending'` — if pending > latest, old low-gas txs are blocking the queue (Ethereum mines nonces strictly in order; mempool evictions can also leave nonce *gaps* that block everything after them). Fix with `server/unstick.py`: it replaces each stuck/gapped nonce with a 0-ETH self-transfer at 5x gas (21k gas each). Run it with the env vars set; enter the highest stuck nonce when prompted.
 
@@ -207,8 +209,8 @@ The current demo uses `zfairexchange.sol` for **everything**, self-funded by the
 
 ## Key Data Structures
 
-- `TestData` — server response: `{epk: base64url, params: JSON string, msg: JSON string, contract_id: hex string, denomination: Int}`
-- `DelegatedData` — stored dmk card. For Waters tokens: `hiding_sign = params` (with `beta_secret`), `hiding_sign_vec2 = JSON(sk1, sk2, sk3)`, `contract_id = bytes32 hex of the HTLC on Sepolia`, `denomination = Int (1/2/5/10/20/100)`, `r = part1 = BigInteger.ZERO`. `userName = "Signing Token #N"`. Scanned cards from QRs without `contract_id` have `contract_id = ""`; without `denomination` default to 1.
+- `TestData` — server response: `{epk: base64url, params: JSON string, msg: JSON string, contract_id: hex string, denomination: Int, gs_circuit: Any?}` — `gs_circuit` is a raw JSON object (Gson maps it to `Any?`; stored as serialized JSON string on the card).
+- `DelegatedData` — stored dmk card. For Waters tokens: `hiding_sign = params` (with `beta_secret`), `hiding_sign_vec2 = JSON(sk1, sk2, sk3)`, `contract_id = bytes32 hex of the HTLC on Sepolia`, `denomination = Int (1/2/5/10/20/100)`, `gs_circuit = JSON string (base_enc + slots_c0 + slots_c1 + epk)` for GS-capable cards, `r = part1 = BigInteger.ZERO`. `userName = "Signing Token #N"`. Scanned cards from QRs without `contract_id` have `contract_id = ""`; without `denomination` default to 1; without `gs_circuit` have `gs_circuit = ""` (legacy cards).
 
 **Gson null gotcha:** Gson ignores Kotlin default values — a missing JSON field lands as `null` in a non-null `String = ""` field, crashing later with `NullPointerException: parameter contract_id` (e.g. in `DelegatedData.copy`). Always guard parsed fields with `?: ""` (`addCardFromQR()` and `bindNewCard` both do this).
 - `PersistencyManager` — SharedPreferences-backed store; `data` ArrayList is shared with the adapter
@@ -250,6 +252,8 @@ Both contracts deployed to Sepolia (chain ID `11155111`).
 
 **Current bug:** `params` sent to Alice during activation includes `beta_secret`. This is a known security hole added only as a workaround for offline re-delegation. The paper's `RDelegate` does NOT require `beta_secret` — see below. Strip it before any real deployment.
 
+**Why `beta_secret` cannot be stripped trivially (investigated August 2026):** `evaluate_paymentbox()` in the Android Rust JNI calls `water_decrypt(&par, &tag, rtag)`, which computes `sk1 = (param.g_alpha * param.beta_secret) + (h_of_id(param, id) * rand_r)` — i.e. it re-derives `dk1` from the master secret rather than decrypting a stored value. `ParamWaters.beta_secret` is also a required (non-optional) `ScalarField` field in the struct; removing it from the JSON causes `serde_json::from_str(&params).unwrap()` to panic → SIGABRT. Properly removing `beta_secret` requires redesigning how the garbled circuit encrypts the activation key: the bank would pre-compute and embed the decryption key material directly in the circuit, so the client never needs the master secret. This is a non-trivial cryptographic change to both the server Rust and Android Rust.
+
 **Server-side test:** `python3 -c "from server import test_redelegate_full; test_redelegate_full()"` — verifies recipient's Waters key passes both pairing checks.
 
 ### Paper's RDelegate — no beta_secret needed
@@ -271,7 +275,7 @@ The algorithm (from paper):
 
 **One-shot enforcement:** Alice's AndroidKeyStore key has `nusecount` budget. Activate uses slots for Alice's tag bits; RDelegate uses the remaining slots for Bob's tag bits. After both, the key is exhausted — Alice cannot re-delegate twice.
 
-**Current implementation bug:** `evaluate_paymentbox` discards the garbled circuit after extracting `(sk1,sk2,sk3)`. The card stores only the derived key, losing the circuit material needed for RDelegate. This is why `beta_secret` was added as a workaround — it must be replaced with proper circuit storage.
+**Fixed:** The GS circuit (`gs_circuit` field on `DelegatedData`) is now stored on the card and used for offline re-delegation via `evaluate_gs()`. `beta_secret` is still transmitted in `params` as a known security gap — see Possible Next Steps for the strip plan.
 
 ### GS Circuit — structure and generation
 
@@ -308,51 +312,59 @@ The bank generates GS alongside GWat by:
 4. `dk2 = H2(a||1) ⊕ c_{γ,1}`, `dk3 = H2(a||2) ⊕ c_{γ,2}`, `dk1 = p'_0 · ∏ p'_i[b_{i,btag_i}]`
 5. Return `ak2 = (dk1, dk2, dk3)` — valid Waters key for Alice's tag (same tag, fresh randomness `r`)
 
-**nUKE budget:** TAG_BITS = 56 bits → 56 ECDH ops for RDelegate + 1 branch = 57 ops. Activate uses `garble_message_size = 5` ops. Total = 62. Set `nusecount ≥ 62` in the attestation (currently allowed values: 40/5/10 — must add 64 or 128 to the allowlist in `server.py`).
+**nUKE budget:** TAG_BITS = 56 bits → 56 ECDH ops for RDelegate + 1 branch = 57 ops. Activate uses `garble_message_size = 5` ops. Total = 62. App requests `nusecount=64`; server allowlist in `verify_attestation` includes 64. GWat still uses 5 positions × 256 items regardless of nusecount.
 
-**Code changes required:**
-- `server/rustcode/src/lib.rs`: `garble_waters()` generates and returns GS JSON alongside the existing circuit JSON
-- `server/server.py`: `/api/delegatedpresig` returns `gs_circuit` field in the response; `verify_attestation` allows larger `nusecount`
-- `paymentbox_otp/.../DelegatedData.kt`: add `gs_circuit: String` field
-- `paymentbox_otp/.../PaymentBoxAdapter.kt`: store `watersData.gs_circuit` on card after activation
-- `paymentbox_otp/app/rust/src/lib.rs`: new JNI `garble_1redelegate_gs(gs_circuit, bob_tag, shared_keys)` → returns `{dk1, dk2, dk3}`
-- `paymentbox_otp/app/rust/src/paymentbox/pbcrypto.rs`: implement `evaluate_gs()` function
+**Status: IMPLEMENTED AND TESTED END-TO-END.** Alice mints → offline re-delegates to Bob via QR (57 AndroidKeyStore ECDH ops, no server contact) → Bob withdraws on-chain. Server contacted exactly twice: once at Mint (Alice) and once at Withdraw (Bob). All code changes below are done:
+- `server/rustcode/src/lib.rs`: `generate_gs()` PyO3 function generates and returns GS JSON
+- `server/server.py`: `getpresig_fn` calls `generate_gs()` for nusecount=64 requests; response includes `gs_circuit`; nusecount=64 added to allowlist
+- `paymentbox_otp/.../DelegatedData.kt`: `gs_circuit: String = ""` field added; `TestData` has `gs_circuit: Any?`
+- `paymentbox_otp/.../PaymentBoxAdapter.kt`: stores `watersData.gs_circuit` (Gson-serialized) on card; requests nusecount=64
+- `paymentbox_otp/app/rust/src/lib.rs`: `Java_..._evaluateGs` JNI wrapper added
+- `paymentbox_otp/app/rust/src/paymentbox/pbcrypto.rs`: `evaluate_gs()` implemented; `hex` crate added to Cargo.toml
 
-### Planned demo flow: offline re-delegation with one phone
+### Demo flow: offline re-delegation (IMPLEMENTED)
 
-**Step 1 — Bob registers (online, one-time)**
-- Bob taps "Register" → calls `/api/register?attestation=...`
-- Server verifies attestation → assigns `user_id` → returns `{user_id, tag: "001_002"}`
-- App stores `{user_id, tag}` locally → generates Bob's **identity QR**: `{user_id, tag}` (~20 bytes)
+**Step 1 — Bob gets identity QR (one-time, offline)**
+- Bob opens app → first-launch dialog asks for account name (e.g. "Bob") → account created, toolbar shows "ORBIT — Bob"
+- Bob taps **My ID** → first use prompts for user_id → stores `uid` as Int in `orbit_identity_Bob` prefs → shows identity QR: `{"uid":2}`
+- Subsequent presses of **My ID** show the stored QR immediately (title: "Bob — uid 002")
 
 **Step 2 — Alice mints (online)**
-- Alice taps Mint → calls `/api/delegatedpresig?attestation=...&denomination=N`
-- Server garbles DK1 for Alice's tag → returns `{epk, params_without_beta, msg, contract_id, denomination}`
-- App evaluates → stores card with `(sk1, sk2, sk3, garbled_circuit, contract_id, denomination)`
-- **Critical change:** card must also store the original `epk` + circuit components for RDelegate
+- Alice taps Mint FAB → picks denomination → app requests nusecount=64 attestation
+- Server garbles GWat (5 positions) + GS circuit (57 ECDH slots for re-delegation) → calls `newContract()` → returns `{epk, params, msg, contract_id, denomination, gs_circuit}`
+- App does 5 ECDH ops (GWat evaluation) → `paymentbox()` JNI → recovers `(sk1, sk2, sk3)`
+- Card stored with `gs_circuit` field intact — ready for offline re-delegation
 
-**Step 3 — Alice re-delegates to Bob (fully offline)**
-- Alice selects card → taps "Re-delegate" → app opens QR scanner
-- Alice scans Bob's identity QR → gets Bob's tag `"001_002"`
-- App calls `redelegate()` JNI: re-evaluates stored garbled circuit at Bob's tag bits using AndroidKeyStore ECDH → produces `ak2 = (dk1, dk2, dk3)` (~128 bytes)
-- App calls `/api/redelegate` with only `{contract_id, denomination}` (no key material needed) → server withdraws Alice's HTLC + creates Bob's HTLC → returns `contract_id_bob`
-- App shows **re-delegation QR**: `{dk1, dk2, dk3, contract_id_bob, denomination}` (~250 bytes) ✓
+**Step 3 — Alice re-delegates to Bob (fully offline, no server needed)**
+- Alice selects card → taps **Re-delegate** → `gsRedelegateLauncher` opens camera (GS path; legacy path for cards without `gs_circuit` falls back to direct QR)
+- Alice scans Bob's identity QR `{"uid":2}` → app constructs GS evaluation tag as `"%03d_%03d".format(card.denomination, bobId.uid)` (e.g. `"001_002"` for a 1C coin to uid 2)
+- `computeGsAk2(card, bobTag)` runs: 57 sequential AndroidKeyStore ECDH ops against GS epk → `evaluateGs()` JNI → `ak2 = (dk1, dk2, dk3)` — **fully offline, no server contact**
+- App shows **re-delegation QR** (title: "Alice → uid 002", body: "1 C transfer key"): `{sk1: ak2.sk1, sk2: ak2.sk2, sk3: ak2.sk3, contract_id: alice_original_contract_id, denomination}` ✓
 - Alice's card removed (one-shot enforced)
+- **No new HTLC needed:** ak2 is a fresh valid Waters key for the same `tag=denomination`, so Bob can call `/api/pay` directly against Alice's original `contract_id`. The `withdraw()` function only verifies the Waters equations — it doesn't care who generated the key.
 
-**Step 4 — Bob activates (fully offline)**
-- Bob taps "Scan" → scans Alice's re-delegation QR → card added directly (ak2 is the raw Waters key, no further evaluation needed — Bob's DK2 step is optional in this demo)
-- Bob's card appears with `contract_id_bob`
+**Step 4 — Bob receives card (offline)**
+- Bob taps **Scan** → scans Alice's re-delegation QR → `addCardFromQR()` creates card with `{sk1, sk2, sk3, contract_id_bob, denomination}`
+- Bob's card appears in grid; `gs_circuit = ""` (Bob uses the key directly, no further GS needed)
 
-**Step 5 — Bob pays (online)**
-- Bob selects card → taps Pay → `/api/pay` → Sepolia withdraw → TX hash → done
+**Step 5 — Bob withdraws (online)**
+- Bob selects card → taps **Withdraw** → POSTs `{sk1,sk2,sk3,contract_id,denomination}` to `/api/pay` → Sepolia withdraw → TX hash dialog → card removed
 
-### Implementation plan (in order)
+**One-phone demo:** Use screenshot QR workflow — Alice shows re-delegation QR, screenshot it, open on laptop screen, Bob presses Scan and scans the laptop screen.
 
-1. **Store full circuit on card** — after `evaluate_paymentbox`, keep `epk` + circuit JSON in `DelegatedData`. Field: `hiding_sign` already holds `params`; add `garbled_circuit` field for the raw circuit JSON.
-2. **New JNI: `redelegate()`** — takes stored circuit + Bob's tag → re-evaluates at Bob's tag bits using AndroidKeyStore ECDH → returns `(dk1, dk2, dk3)`. Mirrors `evaluate_paymentbox` but evaluates at a different tag path.
-3. **Update `/api/redelegate`** — remove `sk1/sk2/sk3` from required body (server no longer needs Alice's key). Accept only `{contract_id, denomination}` → withdraw + newContract → return `contract_id_bob`.
-4. **Update Re-delegate UI** — scan Bob's QR first, call redelegate JNI, POST only contract/denomination, show QR with `ak2 + contract_id_bob`.
-5. **Strip `beta_secret` from params** — server omits it from `/api/delegatedpresig` response. `h_vec` (needed for evaluate) stays; `beta_secret` does not.
+**Known remaining gap — beta_secret:** `beta_secret` is still included in `params` sent to Alice. Cannot be stripped without redesigning `evaluate_paymentbox` (see "beta_secret — bank master secret" section above for details). Strip before any real deployment.
+
+**Known remaining gap — tag encoding mismatch:** There are THREE different tag-to-group-element computations in the codebase that must agree for an end-to-end Waters key to pass the on-chain pairing check:
+1. `h_of_id()` (server Rust, line ~252): iterates the tag as a **string**, decomposing each ASCII byte bit-by-bit into `h_vec` indices.
+2. `water_unlock_solidity()` (server Rust, line ~286): treats the tag as an **integer**, decomposing its bits into `h_vec[0..40]` indices.
+3. `hashlockMatches` in `zfairexchange.sol` (line 224): integer bit-decomposition of `hashlock` — matches `water_unlock_solidity`.
+
+`garble_waters` uses `h_of_id` (path 1) to generate the circuit and the on-chain pairing uses `hashlockMatches` (path 3). For the tag `"001_000"` (DDD_UUU string), `h_of_id` and `water_unlock_solidity` compute entirely different group elements. This means:
+- Alice's evaluated `(sk1,sk2,sk3)` from the garbled circuit is keyed to `H_ascii("001_000")` — it will NEVER pass the on-chain BN254 pairing check (which expects `H_int(1)`).
+- Bob's `ak2` from `evaluate_gs()` is also keyed to `H_ascii(bob_tag)` — it will NEVER pass either.
+- `/api/pay` therefore uses `water_unlock_solidity(denomination)` to produce the server's own Waters key (paths 2 = 3), ignoring the user-submitted `sk1/sk2/sk3`.
+
+**Fix (not yet implemented):** Change `denomination_config` to pass `tag = denomination` as an integer to `h_of_id` by changing `h_of_id` to accept a raw integer OR changing the garbled circuit to use integer bit-decomposition instead of string byte decomposition. Also change `generate_gs` to use integer-based tag bits. Then `computeGsAk2` on Android must pass `denomination` as a single-byte tag (not the `"%03d_%03d"` string). After this fix, Alice/Bob's evaluated keys can be submitted directly to `/api/pay` without the server re-generating its own key. The `DDD_UUU` display on tiles is purely cosmetic and does not need to change.
 
 ## Current Status
 
@@ -360,26 +372,36 @@ Waters-only dmk architecture is implemented end-to-end.
 
 ### UI Layout
 
-Cards are displayed as a **2-column grid** of 160dp square tiles (`GridLayoutManager(2)`). Each tile shows **coin art** (1 gold coin icon for 1C, 2 stacked gold coin icons for 2C) on a fixed dark blue-grey background (`#37474F`, `MaterialCardView`), with the denomination label ("1 C" / "2 C") in smaller text below the coin(s), and the first 8 chars of `contract_id` in the top-right corner ("no HTLC" if empty). All card tiles are uniform colour — no cycling. Tapping a tile selects it (white stroke border via `MaterialCardView.strokeColor`); tapping again deselects. **Long-press a tile → "Delete token?"** removes the card without paying (for dead/no-HTLC cards). Note: use `adapterPosition`, not `bindingAdapterPosition` — the project's RecyclerView is too old for the latter.
+**ActionBar**: shows "ORBIT — AccountName". Overflow menu (⋮) → "Switch account" (shows list of accounts + "＋ New account") / "New account". First launch shows a create-account dialog before any cards load.
+
+Cards are displayed as a **2-column grid** of 160dp square tiles (`GridLayoutManager(2)`). Each tile shows **coin art** (1 gold coin icon for 1C, 2 stacked gold coin icons for 2C) on a fixed dark blue-grey background (`#37474F`, `MaterialCardView`), with:
+- denomination label ("1 C" / "2 C") in bold below the coin(s)
+- identity tag in monospace muted text below that, formatted `DDD_UUU` (denomination padded 3 + `_` + current account's user_id padded 3 from `orbit_identity_AccountName` prefs; shows `DDD_000` if no identity registered)
+- first 8 chars of `contract_id` in the top-right corner ("no HTLC" if empty)
+
+All card tiles are uniform colour — no cycling. Tapping a tile selects it (white stroke border via `MaterialCardView.strokeColor`); tapping again deselects. **Long-press a tile → "Delete token?"** removes the card without paying (for dead/no-HTLC cards). Note: use `adapterPosition`, not `bindingAdapterPosition` — the project's RecyclerView is too old for the latter.
 
 Coin art is `res/drawable/ic_coin.xml` — a gold vector drawable (dark-gold rim `#B8860B`, bright-gold face `#FFD700`, "C" arc). For 2C, a second `ImageView` (`coin2`) overlaps coin1 by 5dp via negative `marginStart`; it is `GONE` for denomination < 2 and `VISIBLE` otherwise.
 
 A **`ExtendedFloatingActionButton`** ("Mint", blue `@color/blue_500`, 64dp tall, `+` icon) sits fixed at the bottom-right corner above the action bar. Tapping it shows a `ListPopupWindow` anchored to the FAB — half the screen wide, with a rounded corner background (`res/drawable/dropdown_bg.xml`, 14dp radius) — listing available denominations. Each row shows coin image(s) + bold denomination label + muted ETH price. The placeholder item that previously occupied the last grid slot has been removed; `dataset.removeAll { it.hiding_sign_vec2.isEmpty() }` strips it on load so old saved data migrates cleanly.
 
-A **fixed bottom action bar** (`#263238`) contains three `MaterialButton`s with icons:
-- **Pay** (dark green `#2E7D32` when active, grey when inactive, `ic_payments_24` icon) — POSTs Waters key to `/api/pay`; greyed out when nothing selected
-- **Re-delegate** (purple `purple_500` when active, grey when inactive, `ic_share_24` icon) — withdraws Alice's HTLC + creates Bob's, then shows QR; card consumed on dismiss; greyed out when nothing selected
-- **Scan** (teal `teal_700`, `ic_qr_code_scanner_24` icon) — always active; opens ZXing scanner
+A **fixed bottom action bar** (`#263238`) contains four `MaterialButton`s with icons:
+- **Withdraw** (dark green `#2E7D32` when active, grey when inactive, `ic_payments_24` icon) — POSTs Waters key to `/api/pay`; greyed out when nothing selected
+- **Re-delegate** (purple `purple_500` when active, grey when inactive, `ic_share_24` icon) — if card has `gs_circuit`: opens camera to scan Bob's identity QR → offline GS evaluation → shows re-delegation QR; otherwise legacy direct QR flow. Card consumed on dismiss. Greyed out when nothing selected.
+- **Scan** (teal `teal_700`, `ic_qr_code_scanner_24` icon) — always active; opens ZXing scanner → `addCardFromQR()` parses `{sk1,sk2,sk3,contract_id,denomination}`
+- **My ID** (indigo `#5C6BC0`, `ic_badge_24` icon) — always active; first tap prompts for user_id and saves it as `uid` (Int) to `orbit_identity_AccountName` prefs; subsequent taps show identity QR `{"uid":N}` (title: "AccountName — uid NNN")
 
 Buttons use `app:backgroundTintList` (not `setBackgroundColor`) on `MaterialButton` with `app:icon` / `app:iconTint`. `updateBottomBarState()` swaps `backgroundTintList` between active colour and grey — buttons always visible, never hidden.
 
 ### Actions
-- **Mint FAB** → `ListPopupWindow` dropdown → user picks denomination → server garbles Waters circuit with `tag=denomination` + calls `newContract()` (denomination's ETH) on Sepolia → Rust evaluates → `(sk1, sk2, sk3)` + `contract_id` + `denomination` stored as "Signing Token #N" card
-- **Pay** → POSTs `{sk1,sk2,sk3,contract_id,denomination}` to `/api/pay` → server calls `withdraw()` on Sepolia → success dialog with TX hash → card removed on OK
-- **Re-delegate** → POSTs `{sk1,sk2,sk3,contract_id,denomination}` to `/api/redelegate` (withdraws Alice's HTLC + creates Bob's at same denomination) → QR dialog with `{sk1, sk2, sk3, contract_id, denomination}`; card removed on dismiss (dmk consumed). Full `garble_redelegate()` crypto is parked — see Re-delegate section above.
-- **Scan** → ZXing scanner → `addCardFromQR()` → new card with `hardcodedParams`, scanned `contract_id` (or `""` if absent), and scanned `denomination` (or 1 if absent)
-- **Long-press** → delete card without paying (cleanup for dead cards)
-- One-timeness enforced: Pay, Re-delegate, and Scan-then-Pay each consume the card exactly once
+- **Mint FAB** → `ListPopupWindow` dropdown → user picks denomination → server garbles Waters circuit (nusecount=64) + GS circuit + calls `newContract()` on Sepolia → Rust evaluates GWat → `(sk1, sk2, sk3)` + `contract_id` + `denomination` + `gs_circuit` stored as "Signing Token #N" card
+- **Withdraw** → POSTs `{sk1,sk2,sk3,contract_id,denomination}` to `/api/pay` → server calls `withdraw()` on Sepolia → success dialog with TX hash → card removed on OK
+- **Re-delegate** (GS path, cards with `gs_circuit`): opens `gsRedelegateLauncher` camera → scan recipient's identity QR `{"uid":N}` → constructs `bobTag = "%03d_%03d".format(denomination, uid)` → `computeGsAk2()` does 57 AndroidKeyStore ECDH ops (offline, no server) → `evaluateGs()` JNI → ak2 → QR dialog (title: "Alice → uid NNN") with `{sk1,sk2,sk3,contract_id: alice_original,denomination}`; card removed on dismiss. Bob withdraws from Alice's original HTLC using ak2 — no new HTLC needed.
+- **Re-delegate** (legacy path, cards without `gs_circuit`): POSTs `{contract_id,denomination}` to `/api/redelegate` directly → QR dialog with stored `{sk1,sk2,sk3,contract_id_bob,denomination}`
+- **Scan** → ZXing scanner → `addCardFromQR()` → new card with `hardcodedParams`, scanned `contract_id` (or `""` if absent), `denomination` (or 1 if absent), `gs_circuit = ""`
+- **My ID** → shows identity QR `{"uid":N}` for current account (namespaced to `orbit_identity_AccountName` prefs); first use prompts for user_id and stores as Int under key `"uid"`
+- **Long-press tile** → delete card without withdrawing (cleanup for dead/no-HTLC cards)
+- One-timeness enforced: Withdraw, Re-delegate, and Scan-then-Withdraw each consume the card exactly once
 
 ### Logcat debugging
 Filter by tags `PaymentBoxAdapter` / `MainActivity`. Every `contract_id` hop is logged: circuit received, card stored, Pay pressed, Redelegate (Alice's + Bob's IDs), card added from QR. Match these against the server console `[NEW]`/`[REDELEGATE]`/`[PAY]` lines to see where an ID gets lost.
@@ -390,14 +412,24 @@ ECDSA variant (`/api/delegatedpresigecdsa`, `paymentboxecdsa()` JNI, `zecdsa.sol
 - `app/build.gradle.kts`: `com.journeyapps:zxing-android-embedded:4.3.0`
 - `AndroidManifest.xml`: `CAMERA` permission
 - `res/raw/waters_params.json`: bundled params (30 KB, deterministic)
-- `MainActivity.kt`: `hardcodedParams`, `qrScanLauncher` (ZXing `ScanContract`), `addCardFromQR()`, `generateQrBitmap()`, `updateBottomBarState()`
+- `MainActivity.kt`: `hardcodedParams`, `qrScanLauncher` (receives payment QR), `gsRedelegateLauncher` (receives Bob's identity QR during Re-delegate), `addCardFromQR()`, `generateQrBitmap()`, `updateBottomBarState()`, `computeGsAk2()` (57 ECDH ops + evaluateGs JNI), `callRedelegateHtlcOnly()` (POSTs contract_id/denomination only); `initWithAccount()` (loads data + sets RecyclerView), `switchToAccount()`, `showSwitchAccountDialog()`, `showCreateAccountDialog()`; `onCreateOptionsMenu`/`onOptionsItemSelected` inflate `R.menu.main_menu`
+- `external fun evaluateGs(gsCircuit, bobTag, sharedKeys)` — JNI into `librust.so`; `evaluate_gs()` in `pbcrypto.rs`
+- `res/menu/main_menu.xml`: overflow menu with "Switch account" and "New account" items
+- `res/drawable/ic_badge_24.xml`: badge icon for My ID button
 - `res/drawable/selection_ring.xml`: unused shape drawable (leftover from prior approach; stroke is now set via `MaterialCardView.strokeColor`)
+
+### adb / networking
+- USB tunnel (recommended): `adb reverse tcp:5000 tcp:5000` — routes phone's `127.0.0.1:5000` → WSL. Re-run after every USB reconnect or phone reboot. adb is at `C:\Users\<name>\AppData\Local\Android\Sdk\platform-tools\adb.exe`.
+- WiFi fallback: Windows port-proxy `netsh ...` → WSL IP. WSL IP changes on restart (`hostname -I`).
 
 NDK note: Linux NDK r23b is downloaded to `/tmp/android-ndk-r23b` during the WSL session (not persistent — re-download on reboot with the command in the recompile section above). The Windows NDK in `AppData/Local/Android/Sdk/ndk/23.1.7779620/` has only Windows binaries and cannot cross-compile from WSL.
 
 ## Possible Next Steps
 
-- **Full paper Pay flow**: Replace the current `zfairexchange.sol` Pay with `DSign` → `zecdsa.sol`. Blocked by the curve mismatch (circuit is secp256r1, `ecrecover` is secp256k1) — see "zecdsa.sol blockers" above. A plan exists (plan file `so-all-of-this-breezy-lampson.md`): Option C (server proxy-signs with its secp256k1 key after verifying the card's `(r,s)`) as demo shortcut; Option A (rewrite Rust circuit to secp256k1) for the real fix.
-- **Offline re-delegation (in progress)**: See "Implementation plan" in RDelegate Crypto Notes. Five steps: store full circuit on card, new `redelegate()` JNI, update `/api/redelegate` to not require sk1/sk2/sk3, update Re-delegate UI, strip `beta_secret` from params.
+- **Multi-account / persona system**: **IMPLEMENTED**. First-launch "Create wallet" dialog, toolbar title "ORBIT — AccountName", overflow menu ⋮ → Switch/New account. Cards stored in `SAVE_AccountName` SharedPreferences; identity tags in `orbit_identity_AccountName`. Coin tiles show `DDD_UUU` tag (denomination + account user_id). Accounts list stored in `ORBIT_META` prefs. Note: existing cards saved under the old `"SAVE"` key are not migrated — users must re-mint after first account creation.
+- **Fix tag encoding mismatch**: `h_of_id` (ASCII string bits) ≠ `water_unlock_solidity` / contract (integer bits). Fix by switching `garble_waters`, `generate_gs`, and Android's `computeGsAk2` to use integer denomination as the tag. After this, user-submitted `(sk1,sk2,sk3)` can be sent directly to `/api/pay` instead of the server re-generating its own key. See "tag encoding mismatch" gap note above.
+- **Strip `beta_secret` from params**: blocked — requires redesigning `evaluate_paymentbox` (currently uses `beta_secret` to re-derive `dk1` from master secret rather than decrypting a stored value). See "beta_secret" section above for details. Known security hole; strip before any real deployment.
+- **`decompress_waters_key` Rust function**: already implemented in `server/rustcode/src/lib.rs` (takes compressed hex sk1/sk2/sk3 → returns affine decimal JSON matching `water_unlock_solidity` format). Not currently used in production `/api/pay` because of the tag encoding mismatch — would produce the correct format but wrong group elements. Will become useful after the tag encoding fix.
+- **Full paper Pay flow**: Replace the current `zfairexchange.sol` Withdraw with `DSign` → `zecdsa.sol`. Blocked by the curve mismatch (circuit is secp256r1, `ecrecover` is secp256k1) — see "zecdsa.sol blockers" above. A plan exists (plan file `so-all-of-this-breezy-lampson.md`): Option C (server proxy-signs with its secp256k1 key after verifying the card's `(r,s)`) as demo shortcut; Option A (rewrite Rust circuit to secp256k1) for the real fix.
 - **Correct purchase flow** (`zfairexchange.sol` as designed): Alice locks ETH → bank reveals Waters key on-chain (atomic swap). Currently the server self-funds both sides; a real deployment needs Alice's Ethereum wallet on the phone.
 - **ECDSA variant in UI**: Re-expose the "New (ECDSA)" path as a separate card type; would use `callToken_ecdsa()` + `paymentboxecdsa()` + `zecdsa.sol`.
