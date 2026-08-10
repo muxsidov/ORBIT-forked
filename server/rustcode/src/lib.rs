@@ -101,7 +101,6 @@ struct ParamECDSA {
 #[derive(Serialize,Deserialize)]
 struct PaymentBox {
     tag: String,
-    rtag: Vec<Vec<u8>>,
     sig3: Vec<u8>,
     sig2: Vec<u8>,
     sig1_firstpart: Vec<u8>,
@@ -458,17 +457,6 @@ fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_
     }
 
     
-    let rand_m = ScalarField::rand(&mut rng);
-    let rand_m_t = Bn254::pairing(g, g2)* rand_m; //some random message in the target group
-    let mut hasher = Sha3_256::new();
-    hasher.update(rand_m_t.to_string()); //Better to use serialzed byte instead. String for convenient.
-    let hashed = hasher.finalize().to_vec();
-    for j in 0..32{
-        aon_key_bytes[j] ^= hashed[j];
-    }
-    let enc_rtag = water_encrypt(&param, &tag, rand_m_t);
-
-
     // encrypt sig1_vecs with chosen_keys.
     let mut enc_sig1_vec = Vec::new();
     let mut key_mat_vec: Vec<Vec<u8>> = Vec::new();
@@ -509,7 +497,6 @@ fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_
 
     let pay_box = PaymentBox {
         tag: tag,
-        rtag: enc_rtag,
         sig3: enc_sig3,
         sig2: enc_sig2,
         sig1_firstpart: enc_sig1_firstpart,
@@ -654,14 +641,6 @@ fn garble_redelegate(param_str: String, osk_sk1: Vec<u8>, osk_sk2: Vec<u8>, osk_
         for j in 0..32 { aon_key_bytes[j] ^= random_bytes[j]; }
     }
 
-    let rand_m = ScalarField::rand(&mut rng);
-    let rand_m_t = Bn254::pairing(g, g2) * rand_m;
-    let mut hasher = Sha3_256::new();
-    hasher.update(rand_m_t.to_string());
-    let hashed = hasher.finalize().to_vec();
-    for j in 0..32 { aon_key_bytes[j] ^= hashed[j]; }
-    let enc_rtag = water_encrypt(&param, &tag2, rand_m_t);
-
     let mut enc_sig1_vec = Vec::new();
     let mut key_mat_vec: Vec<Vec<u8>> = Vec::new();
     for i in 0..garble_message_size {
@@ -691,7 +670,6 @@ fn garble_redelegate(param_str: String, osk_sk1: Vec<u8>, osk_sk2: Vec<u8>, osk_
 
     let pay_box = PaymentBox {
         tag: tag2.clone(),
-        rtag: enc_rtag,
         sig3: enc_sig3,
         sig2: enc_sig2,
         sig1_firstpart: enc_sig1_firstpart,
@@ -723,7 +701,7 @@ fn test_rdelegate_local(params:String, garble_message : String, shared_key_list:
     })
     .collect();
 
-    let (sk1, sk2, sk3) = pbcrypto::evaluate_paymentbox(params, paybox.key_mat_enc, paybox.rtag, paybox.sig1_firstpart, paybox.sig2, paybox.sig3, paybox.sig1_vec, shared_key_bytes, message_pattern, max_selectable_elem, max_item, paybox.tag);
+    let (sk1, sk2, sk3) = pbcrypto::evaluate_paymentbox(params, paybox.key_mat_enc, paybox.sig1_firstpart, paybox.sig2, paybox.sig3, paybox.sig1_vec, shared_key_bytes, message_pattern, max_selectable_elem, max_item, paybox.tag);
     Ok((sk1, sk2, sk3))
 }
 

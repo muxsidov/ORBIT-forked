@@ -102,8 +102,8 @@ _user_registry: dict = {}
 _next_user_id: int = 1
 
 def make_tag(denom: int, user_id: int) -> str:
-    """Format a Waters IBE tag as 'DDD_UUU' (3-digit denomination, 3-digit user_id)."""
-    return f"{denom:03d}_{user_id:03d}"
+    """Format a Waters IBE tag as 'UUU_DDD' (3-digit user_id, 3-digit denomination)."""
+    return f"{user_id:03d}_{denom:03d}"
 
 def denomination_config(denom: int, user_id: int = 0) -> dict:
     """Return tag, hashlock, and ETH amount for a given denomination."""
@@ -156,7 +156,7 @@ def index():
 water_parameter = generate_params_waters()
 ecdsa_parameter = generate_params_ecdsa(water_parameter)
 
-_GS_TAG_BITS = 56  # 7 bytes × 8 bits for "DDD_UUU" tag format
+_GS_TAG_BITS = 56  # 7 bytes × 8 bits for "UUU_DDD" tag format
 
 def getpresig_fn(att_json, tag="001_000"):
     # att_json = json.loads((request.args.get('attestation')))
@@ -198,6 +198,41 @@ def getpresig_fn(att_json, tag="001_000"):
         gs_circuit = gs_json
 
     return garble_msg, epk, gs_circuit
+
+
+def _garble_one_circuit(raw_pk, tag):
+    """Garble one Waters circuit (GWat + GS) for a single AndroidKeyStore pubkey and tag.
+
+    Always generates the GS circuit (57 slots) alongside GWat (5 positions × 256 items),
+    so the returned circuit supports both Pay and offline Re-delegate.
+    Returns (epk_bytes, garble_msg, gs_circuit_dict).
+    """
+    num_selectable_elem = 5
+    num_possible_item_per_elem = 256
+
+    epk = b""
+    shared_key_arr = []
+    for _ in range(num_selectable_elem):
+        for _ in range(num_possible_item_per_elem):
+            priv = ec.generate_private_key(ec.SECP256R1())
+            epk += priv.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+            shared_key_arr.append(priv.exchange(ec.ECDH(), raw_pk))
+    garble_msg = garble_waters(
+        water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag
+    )
+
+    gs_epk = b""
+    gs_shared_keys = []
+    for _ in range(1 + _GS_TAG_BITS * 2):
+        priv = ec.generate_private_key(ec.SECP256R1())
+        gs_epk += priv.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+        gs_shared_keys.append(priv.exchange(ec.ECDH(), raw_pk))
+    gs_json = json.loads(generate_gs(water_parameter, gs_shared_keys, _GS_TAG_BITS))
+    gs_json["epk"] = urlsafe_b64encode(gs_epk).decode("ascii")
+
+    return epk, garble_msg, gs_json
+
+
 # TODO: merge with above / call the above function
 @app.route("/api/delegatedpresig", methods=["GET"])
 def getpresig():
@@ -257,7 +292,9 @@ def getpresig():
     except Exception as e:
         print(f"[WARN] HTLC newContract skipped: {e}")
 
-    resp = {"epk": urlsafe_b64encode(epk).decode("ascii"), "params": water_parameter, "msg": garble_msg, "contract_id": contract_id_hex, "denomination": denomination}
+    params_public = json.loads(water_parameter)
+    params_public.pop('beta_secret', None)
+    resp = {"epk": urlsafe_b64encode(epk).decode("ascii"), "params": json.dumps(params_public), "msg": garble_msg, "contract_id": contract_id_hex, "denomination": denomination}
     if gs_circuit is not None:
         resp["gs_circuit"] = gs_circuit
     return jsonify(resp)
@@ -395,10 +432,80 @@ def redelegate():
         return jsonify({'error': str(e)}), 500
 
 
-def _user_id_from_tag(tag: str) -> int:
-    """Extract user_id from a 'DDD_UUU' tag string."""
+@app.route('/api/replenish', methods=['POST'])
+def replenish():
+    """Batch-issue Waters dmks to top up Alice's wallet to her target coin counts.
+
+    Body: {
+        "attestation": { "att": [...] },
+        "request": [{"denomination": N, "count": K}, ...]
+    }
+    nusecount in the attestation must equal 64 × total_count — one AndroidKeyStore key
+    covers the whole batch; each circuit uses a distinct ephemeral epk set.
+    Returns: {
+        "params": "<Waters public params JSON, beta_secret stripped>",
+        "circuits": [{"denomination", "contract_id", "epk", "msg", "gs_circuit"}, ...]
+    }
+    """
+    body = request.get_json()
+    request_list = body.get('request', [])
+    total_count = sum(int(r['count']) for r in request_list)
+    if total_count == 0:
+        return jsonify({'error': 'no checks requested'}), 400
+
+    is_valid_att, raw_pk, nusecount = verify_attestation(body['attestation']['att'])
+    if not is_valid_att:
+        return jsonify({'error': 'invalid attestation'}), 400
+    expected_nusecount = 64 * total_count
+    if nusecount != expected_nusecount:
+        return jsonify({'error': f'nusecount {nusecount} != 64 × {total_count} = {expected_nusecount}'}), 400
+
+    params_public = json.loads(water_parameter)
+    params_public.pop('beta_secret', None)
+
+    blockchain_ok = False
     try:
-        return int(tag.split('_')[1])
+        _init_web3()
+        _ensure_setup()
+        blockchain_ok = True
+    except Exception as e:
+        print(f"[WARN] Blockchain unavailable for /api/replenish: {e}")
+
+    circuits = []
+    for req in request_list:
+        denomination = int(req['denomination'])
+        count = int(req['count'])
+        cfg = denomination_config(denomination)
+        for _ in range(count):
+            epk, garble_msg, gs_circuit = _garble_one_circuit(raw_pk, cfg['tag'])
+            contract_id_hex = ""
+            if blockchain_ok:
+                try:
+                    timelock = int(time.time()) + 3600
+                    receipt = _send_tx(
+                        _htlc.functions.newContract(_eth_acct.address, cfg['hashlock'], timelock),
+                        value=_w3.to_wei(cfg['eth'], 'ether')
+                    )
+                    logs = _htlc.events.HTLCETHNew().process_receipt(receipt)
+                    contract_id_hex = logs[0]['args']['contractId'].hex()
+                    print(f"[REPLENISH] denomination={denomination} contract_id={contract_id_hex}")
+                except Exception as e:
+                    print(f"[WARN] HTLC newContract skipped for denomination={denomination}: {e}")
+            circuits.append({
+                'denomination': denomination,
+                'contract_id': contract_id_hex,
+                'epk': urlsafe_b64encode(epk).decode('ascii'),
+                'msg': garble_msg,
+                'gs_circuit': gs_circuit,
+            })
+
+    return jsonify({'params': json.dumps(params_public), 'circuits': circuits})
+
+
+def _user_id_from_tag(tag: str) -> int:
+    """Extract user_id from a 'UUU_DDD' tag string."""
+    try:
+        return int(tag.split('_')[0])
     except (IndexError, ValueError):
         return 0
 
@@ -509,7 +616,8 @@ def verify_attestation(att):
             if isinstance(value, list):
                 value = value[0] if value else 0
             keycount = int(value)
-            if keycount == 1 or keycount==256 or keycount==64 or keycount==32 or keycount==160 or keycount==40 or keycount==20 or keycount==5 or keycount==10:
+            # Existing single-circuit values + any positive multiple of 64 (for batch replenish: 128, 192, 320, ...)
+            if keycount in {1, 5, 10, 20, 32, 40, 64, 160, 256} or (keycount > 0 and keycount % 64 == 0):
                 has_valid_property = True
         read_result = decoder.read()
         if read_result!=None:

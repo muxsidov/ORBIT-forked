@@ -37,8 +37,6 @@ fn ark_de<'de, D, A: CanonicalDeserialize>(data: D) -> Result<A, D::Error> where
 
 #[derive(Serialize,Deserialize)]
 struct ParamWaters {
-    // #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
-    // alpha_secret: ScalarField,
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     beta_secret: ScalarField,
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
@@ -152,7 +150,7 @@ fn water_decrypt(param: &ParamWaters, id: &str, message: Vec<Vec<u8>>) -> pairin
     decrypt_m
 }
 
-pub fn evaluate_paymentbox(params:String, key_mat_enc:Vec<Vec<u8>>, rtag:Vec<Vec<u8>>, enc_sig1_1:Vec<u8>, enc_sig2 :Vec<u8>, enc_sig3 :Vec<u8>, enc_sig1_vec:Vec<Vec<u8>>, shared_key:Vec<u8>, message_pattern:Vec<u8>, garble_message_size :usize, MAX_ITEM :usize, tag: String) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+pub fn evaluate_paymentbox(params:String, key_mat_enc:Vec<Vec<u8>>, enc_sig1_1:Vec<u8>, enc_sig2 :Vec<u8>, enc_sig3 :Vec<u8>, enc_sig1_vec:Vec<Vec<u8>>, shared_key:Vec<u8>, message_pattern:Vec<u8>, garble_message_size :usize, MAX_ITEM :usize, tag: String) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let par: ParamWaters = serde_json::from_str(&params).unwrap();
     let g = par.g;
     let g2 = par.g2;
@@ -201,15 +199,6 @@ pub fn evaluate_paymentbox(params:String, key_mat_enc:Vec<Vec<u8>>, rtag:Vec<Vec
         counter+=1;
     }
 
-    let rtag_dec = water_decrypt(&par, &tag, rtag);
-    let mut hasher = Sha3_256::new();
-    hasher.update(rtag_dec.to_string()); //Better to use serialzed byte instead. String for convenient.
-    let hashed = hasher.finalize().to_vec();
-    for j in 0..32{
-        aon_key[j] ^= hashed[j];
-    }
-
-    // debug!("aon_key: {:?}", aon_key);
     let sig1_firstpart_dec = decrypt(&enc_sig1_1[..], &aon_key,1);
     let sig_1_hprime_masked = G::deserialize_compressed(&sig1_firstpart_dec[..]).unwrap();
 
