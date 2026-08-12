@@ -463,14 +463,6 @@ def replenish():
     params_public = json.loads(water_parameter)
     params_public.pop('beta_secret', None)
 
-    blockchain_ok = False
-    try:
-        _init_web3()
-        _ensure_setup()
-        blockchain_ok = True
-    except Exception as e:
-        print(f"[WARN] Blockchain unavailable for /api/replenish: {e}")
-
     circuits = []
     for req in request_list:
         denomination = int(req['denomination'])
@@ -478,28 +470,42 @@ def replenish():
         cfg = denomination_config(denomination)
         for _ in range(count):
             epk, garble_msg, gs_circuit = _garble_one_circuit(raw_pk, cfg['tag'])
-            contract_id_hex = ""
-            if blockchain_ok:
-                try:
-                    timelock = int(time.time()) + 3600
-                    receipt = _send_tx(
-                        _htlc.functions.newContract(_eth_acct.address, cfg['hashlock'], timelock),
-                        value=_w3.to_wei(cfg['eth'], 'ether')
-                    )
-                    logs = _htlc.events.HTLCETHNew().process_receipt(receipt)
-                    contract_id_hex = logs[0]['args']['contractId'].hex()
-                    print(f"[REPLENISH] denomination={denomination} contract_id={contract_id_hex}")
-                except Exception as e:
-                    print(f"[WARN] HTLC newContract skipped for denomination={denomination}: {e}")
             circuits.append({
                 'denomination': denomination,
-                'contract_id': contract_id_hex,
+                'contract_id': "",
                 'epk': urlsafe_b64encode(epk).decode('ascii'),
                 'msg': garble_msg,
                 'gs_circuit': gs_circuit,
             })
 
     return jsonify({'params': json.dumps(params_public), 'circuits': circuits})
+
+
+@app.route('/api/lock', methods=['POST'])
+def lock():
+    """Lock capital for one dormant dmk right before it's spent (Withdraw or Re-delegate).
+
+    Body: {"denomination": N}
+    Returns: {"contract_id": hex}  (or {"error": ...}, 500/400)
+    """
+    try:
+        _init_web3()
+        _ensure_setup()
+        denomination = int(request.json.get('denomination', 1))
+        cfg = denomination_config(denomination)
+        timelock = int(time.time()) + 3600
+        receipt = _send_tx(
+            _htlc.functions.newContract(_eth_acct.address, cfg['hashlock'], timelock),
+            value=_w3.to_wei(cfg['eth'], 'ether')
+        )
+        if receipt['status'] != 1:
+            return jsonify({'error': 'newContract failed'}), 500
+        logs = _htlc.events.HTLCETHNew().process_receipt(receipt)
+        contract_id_hex = logs[0]['args']['contractId'].hex()
+        print(f"[LOCK] denomination={denomination} contract_id={contract_id_hex}")
+        return jsonify({'contract_id': contract_id_hex})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 def _user_id_from_tag(tag: str) -> int:

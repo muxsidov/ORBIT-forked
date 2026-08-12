@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+@ORBIT_PAPER.md
+
 ## Project Overview
 
 ORBIT is an academic research prototype for a **one-shot payment system** using garbled circuits and Waters IBE. The system has three phases matching the paper:
@@ -35,8 +37,10 @@ bash build.sh   # runs: cd rustcode && maturin develop --release
 ```
 
 Key endpoints:
-- `GET /api/delegatedpresig?attestation=...&denomination=N` — verifies Android attestation (nusecount=64 required), garbles Waters circuit with `tag=N`, generates GS circuit (57 ECDH slots for offline re-delegation), calls `newContract()` on Sepolia, returns `{epk, params, msg, contract_id, denomination, gs_circuit}`. `denomination` defaults to 1.
+- `GET /api/delegatedpresig?attestation=...&denomination=N` — verifies Android attestation (nusecount=64 required), garbles Waters circuit with `tag=N`, generates GS circuit (57 ECDH slots for offline re-delegation), calls `newContract()` on Sepolia (locks capital immediately), returns `{epk, params, msg, contract_id, denomination, gs_circuit}`. `denomination` defaults to 1. Used by the single-mint path (`issueCard()`) when no dormant stock exists for that denomination.
 - `GET /api/delegatedpresigecdsa?attestation=...` — same but ECDSA variant (no blockchain call, no denomination)
+- `POST /api/replenish` — body `{attestation: {att:[...]}, request: [{denomination, count}, ...]}` — batch-garbles Waters+GS circuits for every `(denomination, count)` pair, **does NOT call `newContract()`** — every returned circuit has `contract_id: ""` (dormant/unlocked). `nusecount` in the attestation must equal `64 × total_count` (one AndroidKeyStore key spans the whole batch). Returns `{params, circuits: [{denomination, contract_id:"", epk, msg, gs_circuit}, ...]}`. Backs the "Checks" / Sync flow (see Dormant Stock section below).
+- `POST /api/lock` — body `{denomination}` — calls `newContract()` on Sepolia to lock capital for one already-garbled dormant dmk, right before it's spent. Returns `{contract_id}`. This is what turns a dormant dmk into a live/active one.
 - `POST /api/pay` — body `{sk1, sk2, sk3, contract_id, denomination}` — calls `withdraw()` on `zfairexchange.sol` using the correct `hashlock=denomination`, returns `{tx_hash, contract_id}`
 - `POST /api/redelegate` — body `{contract_id, denomination}` — withdraws Alice's HTLC (skipped gracefully if `contract_id` is empty), then `newContract()` creates a fresh HTLC for Bob at the same denomination's ETH amount, returns `{contract_id}` for Bob. sk1/sk2/sk3 NOT required — server derives Waters key from its own beta_secret for on-chain use.
 - `GET /api/waters_solidity_params?id=<int>` — returns Waters params + signing key for given id in Solidity-compatible format; used by `ztest_htlc.ipynb`
@@ -166,16 +170,32 @@ The current demo uses `zfairexchange.sol` for **everything**, self-funded by the
 3. Server-side `evaluate_ecdsa` returns nothing (verifies internally only); only the Android JNI returns `{"r","s"}`.
 4. `zecdsa.sol` payout is hardcoded at 0.00001 ETH per claim; it was tested (`ztest.ipynb`) with standard Ethereum `eth_sign`, not ORBIT circuit output.
 
+## Dormant Stock — decoupling minting from capital-locking
+
+**(Implemented, October 2026.)** Mirrors the paper's `Delegate` (offline, free) vs. `Unlock`+payment (online, capital-committing) split: minting a Waters garbled circuit and locking Sepolia capital for it are now two separate steps, so Alice can hold a stock of dormant dmks without every one of them committing ETH.
+
+- **Dormant dmk**: a garbled Waters+GS circuit exists (from `/api/replenish`), but `contract_id == ""` — no capital locked. Stored in a separate list, `dormantCards` (`MainActivity.kt`), persisted via `PersistencyManager.dormant` / `saveDormant()` / `loadDormant()` under SharedPreferences key `SAVE_DORMANT_$account`. **Dormant dmks never appear as grid tiles** — the grid (`profileAdapter.dataSet`) only ever holds live/active cards.
+- **Live/active dmk**: capital is locked (`contract_id` is a real HTLC id) and the card sits in `dataSet`, visible in the main grid, spendable via Withdraw/Re-delegate — same as before this change.
+- **Promotion**: `activateOrMint(denomination)` (`MainActivity.kt`) is what the Mint FAB now calls. If a dormant dmk of that denomination exists, it POSTs `{denomination}` to `/api/lock` (locks capital), then moves that card from `dormantCards` into `profileAdapter.dataSet` with the returned `contract_id`. If no dormant stock exists, it falls back to `issueCard(denomination)` — the original single-mint path via `/api/delegatedpresig`, which garbles *and* locks in one call.
+- **Sync**: overflow menu → "Sync" → `showSyncDialog()` computes `deficit = target − currentDormantCount` per denomination (targets from `loadTargets()`/`orbit_targets_$account`) and calls `performSync(deficit)`, which POSTs the deficit to `/api/replenish` and appends the returned circuits to `dormantCards` (never touches the grid).
+- **Checks**: a second FAB next to Mint (purple, `fabChecks`) opens `showChecksDialog()` — lets the user edit the per-denomination Sync *targets* after account creation (previously only settable once, in the Create-wallet dialog). Each row is `[coin icon] N C  [−] <target> [+]`; tapping `+`/`−` immediately mutates and persists the target via `saveTargets()` — it does **not** mint or delete any dmk directly. A "Sync now" button in the same dialog calls the existing `showSyncDialog()` to fill the newly-edited deficit without leaving the dialog. Deleting individual already-minted dormant dmks, and "deactivating" a live card back to dormant (which would require an on-chain `refund()` after the HTLC timelock — no server endpoint for this exists yet), are both explicitly out of scope / future work.
+- **Mint dropdown counts**: the `ListPopupWindow` opened by the Mint FAB shows a live per-denomination dormant count next to each row (`dropdown_denom_item.xml`'s `dormant_count_label`, e.g. "1C / 0.01 ETH — 3x") computed from `dormantCards.groupBy{it.denomination}.mapValues{it.value.size}`.
+- **New wallet default**: `showCreateAccountDialog()`'s per-denomination target picker now defaults to **0** (was 3) — new accounts start with no preordered dormant stock.
+
+### Per-Coin Counter — telling coins of the same denomination apart
+
+**(Implemented, October 2026.)** Every dmk gets a `coinIndex: Int` field on `DelegatedData`, assigned once at mint time by `nextCoinIndex(denomination)` (`MainActivity.kt`) — a 0-based, monotonically-increasing, per-account-per-denomination sequence number persisted in `orbit_coin_counters_$account` (mirrors the existing `orbit_targets_$account` pattern). It's assigned at exactly the 3 places a new `DelegatedData` is constructed: `PaymentBoxAdapter.issueCard()`, `MainActivity.performSync()` (once per circuit in the batch), and `MainActivity.addCardFromQR()` (Bob's incoming card gets *his* account's next index, independent of the sender's). It survives promotion from dormant → live unchanged (`activateOrMint()` only does `dormantCard.copy(contract_id = ...)`), and is never reused or decremented when a coin is later spent or deleted — the counter only ever increments. The tile displays it as the third segment of the tag, `UUU_DDD_CCC` (see UI Layout below). This is purely a client-side/cosmetic feature — confirmed structurally independent from the cryptographic `bobTag` used in `computeGsAk2()`/`evaluateGs()` for GS re-delegation, so it required no server or Rust changes.
+
 ## Use Phase Flow
 
 ### New (Activation + HTLC creation)
-1. User taps the **Mint FAB** (bottom-right) → `ListPopupWindow` appears with denomination rows ("1 C / 0.01 ETH", "2 C / 0.02 ETH", …) → user picks one
-2. Server garbles Waters circuit with `tag=denomination` → app evaluates → `(sk1, sk2, sk3)` recovered
-3. Server calls `newContract(server_wallet, tag=denomination, timelock)` → locks `_DENOM_ETH[denomination]` ETH on Sepolia
-4. `contract_id` and `denomination` returned in the response and stored on the card
-5. Card appears in the grid — coin art shows 1 or 2 gold coin icons, denomination label below, `contract_id` prefix in top-right
+1. User taps the **Mint FAB** (bottom-right) → `ListPopupWindow` appears with denomination rows ("1 C / 0.01 ETH — Nx", …) showing live dormant-stock counts → user picks one
+2. `activateOrMint(denomination)`: if dormant stock exists for that denomination, POSTs `/api/lock` to commit capital and promotes the existing circuit into the grid; otherwise falls back to `issueCard(denomination)` (garble + lock in one `/api/delegatedpresig` call, as originally)
+3. Either way, the app ends up with `(sk1, sk2, sk3)` recovered (already evaluated at mint time for dormant cards) and a real `contract_id` locking `_DENOM_ETH[denomination]` ETH on Sepolia
+4. `contract_id` and `denomination` are stored on the card
+5. Card appears in the grid — coin art shows 1/2 gold coin icons, denomination label, tag (`UUU_DDD_CCC`, see Per-Coin Counter below), `contract_id` prefix in top-right
 
-**Dead cards:** cards created without the blockchain env vars set, or whose `newContract` timed out, have `contract_id = ""` (tile shows "no HTLC"). They can never Pay. Long-press the tile → "Delete token?" to remove them. If a timed-out `newContract` mines later, the ETH is locked in an orphaned HTLC — recoverable via `refund()` after the 1-hour timelock.
+**Dead cards:** cards created without the blockchain env vars set, or whose `newContract`/`/api/lock` timed out, have `contract_id = ""` (tile shows "no HTLC"). They can never Pay. Long-press the tile → "Delete token?" to remove them. If a timed-out `newContract` mines later, the ETH is locked in an orphaned HTLC — recoverable via `refund()` after the 1-hour timelock.
 
 ### Pay (Waters key → Sepolia withdraw)
 1. User selects a card, taps "Pay"
@@ -210,10 +230,10 @@ The current demo uses `zfairexchange.sol` for **everything**, self-funded by the
 ## Key Data Structures
 
 - `TestData` — server response: `{epk: base64url, params: JSON string, msg: JSON string, contract_id: hex string, denomination: Int, gs_circuit: Any?}` — `gs_circuit` is a raw JSON object (Gson maps it to `Any?`; stored as serialized JSON string on the card).
-- `DelegatedData` — stored dmk card. For Waters tokens: `hiding_sign = params` (no `beta_secret` — stripped by server), `hiding_sign_vec2 = JSON(sk1, sk2, sk3)`, `contract_id = bytes32 hex of the HTLC on Sepolia`, `denomination = Int (1/2/5/10/20/100)`, `gs_circuit = JSON string (base_enc + slots_c0 + slots_c1 + epk)` for GS-capable cards, `r = part1 = BigInteger.ZERO`. `userName = "Signing Token #N"`. Scanned cards from QRs without `contract_id` have `contract_id = ""`; without `denomination` default to 1; without `gs_circuit` have `gs_circuit = ""` (legacy cards).
+- `DelegatedData` — stored dmk card. For Waters tokens: `hiding_sign = params` (no `beta_secret` — stripped by server), `hiding_sign_vec2 = JSON(sk1, sk2, sk3)`, `contract_id = bytes32 hex of the HTLC on Sepolia` (`""` for a dormant, not-yet-locked dmk), `denomination = Int (1/2/5/10/20/50/100)`, `gs_circuit = JSON string (base_enc + slots_c0 + slots_c1 + epk)` for GS-capable cards, `coinIndex = Int` (0-based, per-account-per-denomination mint sequence number — see Per-Coin Counter below), `r = part1 = BigInteger.ZERO`. `userName = "Signing Token #N"`. Scanned cards from QRs without `contract_id` have `contract_id = ""`; without `denomination` default to 1; without `gs_circuit` have `gs_circuit = ""` (legacy cards); without `coinIndex` default to 0 (also legacy — pre-existing cards saved before this field was added always read back as `coinIndex=0`, since Gson uses the type default for a missing field rather than erroring).
 
-**Gson null gotcha:** Gson ignores Kotlin default values — a missing JSON field lands as `null` in a non-null `String = ""` field, crashing later with `NullPointerException: parameter contract_id` (e.g. in `DelegatedData.copy`). Always guard parsed fields with `?: ""` (`addCardFromQR()` and `bindNewCard` both do this).
-- `PersistencyManager` — SharedPreferences-backed store; `data` ArrayList is shared with the adapter
+**Gson null gotcha:** Gson ignores Kotlin default values — a missing JSON field lands as `null` in a non-null `String = ""` field, crashing later with `NullPointerException: parameter contract_id` (e.g. in `DelegatedData.copy`). Always guard parsed fields with `?: ""` (`addCardFromQR()` and `bindNewCard` both do this). For non-null primitive fields like `Int`, Gson instead silently substitutes the JVM default (`0`) rather than crashing — this is why old cards minted before `coinIndex` existed display `000` instead of erroring.
+- `PersistencyManager` — SharedPreferences-backed store; `data` ArrayList (live/active cards, key `SAVE_$account`) is shared with the adapter; `dormant` ArrayList (dormant dmks, key `SAVE_DORMANT_$account`) is not — see Dormant Stock section above
 - `VariantConfig` — selects between SIGN (ECDSA) and REDELEGATE (Waters) variants with `count` and `wordSize`. Main demo uses `RDelegateByteInstance()` (count=5, wordSize=8)
 - Server `ECDSA` struct (Rust): `{tag, rtag, r, s0, s_vec, key_mat_enc}` — the garbled ECDSA components (ECDSA variant, not used in current UI)
 
@@ -380,14 +400,16 @@ Waters-only dmk architecture is implemented end-to-end.
 
 Cards are displayed as a **2-column grid** of 160dp square tiles (`GridLayoutManager(2)`). Each tile shows **coin art** (1 gold coin icon for 1C, 2 stacked gold coin icons for 2C) on a fixed dark blue-grey background (`#37474F`, `MaterialCardView`), with:
 - denomination label ("1 C" / "2 C") in bold below the coin(s)
-- identity tag in monospace muted text below that, formatted `UUU_DDD` (current account's user_id padded 3 + `_` + denomination padded 3 from `orbit_identity_AccountName` prefs; shows `000_DDD` if no identity registered)
+- identity tag in monospace muted text below that, formatted `UUU_DDD_CCC` (current account's user_id padded 3 + `_` + denomination padded 3 + `_` + `coinIndex` padded 3, from `orbit_identity_AccountName` prefs; shows `000_DDD_CCC` if no identity registered). `CCC` is a 0-based, monotonically-increasing, per-account-per-denomination sequence number assigned once at mint time (`nextCoinIndex()`, persisted in `orbit_coin_counters_$account`) — it never changes when a coin is later spent/deleted, and is purely cosmetic (structurally independent from the cryptographic `bobTag` used in GS re-delegation, see `computeGsAk2()` below).
 - first 8 chars of `contract_id` in the top-right corner ("no HTLC" if empty)
 
 All card tiles are uniform colour — no cycling. Tapping a tile selects it (white stroke border via `MaterialCardView.strokeColor`); tapping again deselects. **Long-press a tile → "Delete token?"** removes the card without paying (for dead/no-HTLC cards). Note: use `adapterPosition`, not `bindingAdapterPosition` — the project's RecyclerView is too old for the latter.
 
 Coin art is `res/drawable/ic_coin.xml` — a gold vector drawable (dark-gold rim `#B8860B`, bright-gold face `#FFD700`, "C" arc). For 2C, a second `ImageView` (`coin2`) overlaps coin1 by 5dp via negative `marginStart`; it is `GONE` for denomination < 2 and `VISIBLE` otherwise.
 
-A **`ExtendedFloatingActionButton`** ("Mint", blue `@color/blue_500`, 64dp tall, `+` icon) sits fixed at the bottom-right corner above the action bar. Tapping it shows a `ListPopupWindow` anchored to the FAB — half the screen wide, with a rounded corner background (`res/drawable/dropdown_bg.xml`, 14dp radius) — listing available denominations. Each row shows coin image(s) + bold denomination label + muted ETH price. The placeholder item that previously occupied the last grid slot has been removed; `dataset.removeAll { it.hiding_sign_vec2.isEmpty() }` strips it on load so old saved data migrates cleanly.
+Two **`ExtendedFloatingActionButton`**s sit side-by-side at the bottom-right corner above the action bar, inside a wrapping `LinearLayout` (`activity_main.xml`) so they auto-space regardless of label width:
+- **Checks** (purple `@color/purple_500`, `ic_badge_24` icon) — opens `showChecksDialog()`, letting the user edit per-denomination Sync targets after account creation (see Dormant Stock section above). Placed to the left of Mint.
+- **Mint** (blue `@color/blue_500`, 64dp tall, `+` icon) — tapping it shows a `ListPopupWindow` anchored to the FAB — half the screen wide, with a rounded corner background (`res/drawable/dropdown_bg.xml`, 14dp radius) — listing available denominations. Each row shows coin image(s) + bold denomination label + muted ETH price + live dormant-stock count ("Nx"). Selecting a row calls `activateOrMint(denomination)`, not a direct mint. The placeholder item that previously occupied the last grid slot has been removed; `dataset.removeAll { it.hiding_sign_vec2.isEmpty() }` strips it on load so old saved data migrates cleanly.
 
 A **fixed bottom action bar** (`#263238`) contains four `MaterialButton`s with icons:
 - **Withdraw** (dark green `#2E7D32` when active, grey when inactive, `ic_payments_24` icon) — POSTs Waters key to `/api/pay`; greyed out when nothing selected
@@ -398,7 +420,8 @@ A **fixed bottom action bar** (`#263238`) contains four `MaterialButton`s with i
 Buttons use `app:backgroundTintList` (not `setBackgroundColor`) on `MaterialButton` with `app:icon` / `app:iconTint`. `updateBottomBarState()` swaps `backgroundTintList` between active colour and grey — buttons always visible, never hidden.
 
 ### Actions
-- **Mint FAB** → `ListPopupWindow` dropdown → user picks denomination → server garbles Waters circuit (nusecount=64) + GS circuit + calls `newContract()` on Sepolia → Rust evaluates GWat → `(sk1, sk2, sk3)` + `contract_id` + `denomination` + `gs_circuit` stored as "Signing Token #N" card
+- **Checks FAB** → `showChecksDialog()` → per-denomination `[−] target [+]` rows, editing `orbit_targets_$account` in place; "Sync now" button triggers the same fill-the-deficit flow as the overflow menu's Sync
+- **Mint FAB** → `ListPopupWindow` dropdown (denomination + ETH price + dormant "Nx" count) → user picks denomination → `activateOrMint()`: promotes an existing dormant dmk via `/api/lock` if stock exists, else mints+locks fresh via `/api/delegatedpresig` (garbles Waters circuit nusecount=64 + GS circuit + calls `newContract()` on Sepolia) → `(sk1, sk2, sk3)` + `contract_id` + `denomination` + `gs_circuit` + `coinIndex` stored as "Signing Token #N" card
 - **Withdraw** → POSTs `{sk1,sk2,sk3,contract_id,denomination}` to `/api/pay` → server calls `withdraw()` on Sepolia → success dialog with TX hash → card removed on OK
 - **Re-delegate** (GS path, cards with `gs_circuit`): opens `gsRedelegateLauncher` camera → scan recipient's identity QR `{"uid":N}` → constructs `bobTag = "%03d_%03d".format(uid, denomination)` → `computeGsAk2()` does 57 AndroidKeyStore ECDH ops (offline, no server) → `evaluateGs()` JNI → ak2 → QR dialog (title: "Alice → uid NNN") with `{sk1,sk2,sk3,contract_id: alice_original,denomination}`; card removed on dismiss. Bob withdraws from Alice's original HTLC using ak2 — no new HTLC needed.
 - **Re-delegate** (legacy path, cards without `gs_circuit`): POSTs `{contract_id,denomination}` to `/api/redelegate` directly → QR dialog with stored `{sk1,sk2,sk3,contract_id_bob,denomination}`
@@ -416,7 +439,7 @@ ECDSA variant (`/api/delegatedpresigecdsa`, `paymentboxecdsa()` JNI, `zecdsa.sol
 - `app/build.gradle.kts`: `com.journeyapps:zxing-android-embedded:4.3.0`
 - `AndroidManifest.xml`: `CAMERA` permission
 - `res/raw/waters_params.json`: bundled params (30 KB, deterministic)
-- `MainActivity.kt`: `hardcodedParams`, `qrScanLauncher` (receives payment QR), `gsRedelegateLauncher` (receives Bob's identity QR during Re-delegate), `addCardFromQR()`, `generateQrBitmap()`, `updateBottomBarState()`, `computeGsAk2()` (57 ECDH ops + evaluateGs JNI), `callRedelegateHtlcOnly()` (POSTs contract_id/denomination only); `initWithAccount()` (loads data + sets RecyclerView), `switchToAccount()`, `showSwitchAccountDialog()`, `showCreateAccountDialog()`; `onCreateOptionsMenu`/`onOptionsItemSelected` inflate `R.menu.main_menu`
+- `MainActivity.kt`: `hardcodedParams`, `qrScanLauncher` (receives payment QR), `gsRedelegateLauncher` (receives Bob's identity QR during Re-delegate), `addCardFromQR()`, `generateQrBitmap()`, `updateBottomBarState()`, `computeGsAk2()` (57 ECDH ops + evaluateGs JNI), `callRedelegateHtlcOnly()` (POSTs contract_id/denomination only); `initWithAccount()` (loads data + sets RecyclerView), `switchToAccount()`, `showSwitchAccountDialog()`, `showCreateAccountDialog()`; `onCreateOptionsMenu`/`onOptionsItemSelected` inflate `R.menu.main_menu`; `activateOrMint()`/`callLock()` (promote dormant→live via `/api/lock`); `showChecksDialog()` (edit Sync targets); `showSyncDialog()`/`performSync()` (batch-mint dormant stock via `/api/replenish`); `loadTargets()`/`saveTargets()` (`orbit_targets_$account`); `nextCoinIndex()`/`loadCoinCounters()`/`saveCoinCounters()` (`orbit_coin_counters_$account`, per-denomination mint sequence for the tile tag)
 - `external fun evaluateGs(gsCircuit, bobTag, sharedKeys)` — JNI into `librust.so`; `evaluate_gs()` in `pbcrypto.rs`
 - `res/menu/main_menu.xml`: overflow menu with "Switch account" and "New account" items
 - `res/drawable/ic_badge_24.xml`: badge icon for My ID button
