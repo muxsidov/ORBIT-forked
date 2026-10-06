@@ -10,7 +10,7 @@ import sys, os
 from base64 import urlsafe_b64encode, urlsafe_b64decode
 from flask import Flask, session, request, redirect, abort, jsonify
 
-from rustcode import test_water, test_ecdsa, test_activate, test_unlock, test_dsign_local, test_rdelegate_local, garble_waters, garble_redelegate, garble_ecdsa, generate_params_waters,generate_params_ecdsa, test_encrypt, water_unlock_solidity, water_derive_ak, generate_gs, decompress_waters_key
+from rustcode import test_evaluate_gs, test_verify_gs_key, test_water, test_ecdsa, test_activate, test_unlock, test_dsign_local, test_rdelegate_local, garble_waters, garble_redelegate, garble_ecdsa, generate_params_waters,generate_params_ecdsa, test_encrypt, water_unlock_solidity, water_derive_ak, garble_waters_with_gs, decompress_waters_key
 # poseidon
 
 import os
@@ -156,20 +156,43 @@ def index():
 water_parameter = generate_params_waters()
 ecdsa_parameter = generate_params_ecdsa(water_parameter)
 
-_GS_TAG_BITS = 56  # 7 bytes × 8 bits for "UUU_DDD" tag format
+_GS_TAG_BITS = 88  # 11 bytes × 8 bits for "UUU_DDD_CCC" tag format (uid + denomination + per-recipient coin counter)
+# 5 GWat + 1 GS branch + 88 GS bits, exactly: GS is all-or-nothing and linked to GWat, so any
+# spare use would let a client open both slots of a tag bit and derive keys for extra tags.
+_GS_NUSECOUNT = 94
+
+
+def _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag):
+    """Garble GWat (from shared_key_arr) plus its linked GS circuit for raw_pk.
+
+    Returns (garble_msg, gs_circuit_dict) where gs_circuit_dict includes its "epk".
+    """
+    gs_epk = b""
+    gs_shared_keys = []
+    for _ in range(1 + _GS_TAG_BITS * 2):
+        priv = ec.generate_private_key(ec.SECP256R1())
+        gs_epk += priv.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+        gs_shared_keys.append(priv.exchange(ec.ECDH(), raw_pk))
+    garble_msg, gs_str = garble_waters_with_gs(
+        water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag,
+        gs_shared_keys, _GS_TAG_BITS,
+    )
+    gs_json = json.loads(gs_str)
+    gs_json["epk"] = urlsafe_b64encode(gs_epk).decode("ascii")
+    return garble_msg, gs_json
 
 def getpresig_fn(att_json, tag="001_000"):
     # att_json = json.loads((request.args.get('attestation')))
     is_valid_att, targetpk, nusecount = verify_attestation(att_json)
-    assert nusecount==40 or nusecount==5 or nusecount==10 or nusecount==64, "Currently only support nUSE Count = 40/5/10/64, received:" +  str(nusecount)
-    # nusecount==64: GWat uses 5 positions (same as nusecount==5), GS uses remaining 57 slots
+    assert nusecount==40 or nusecount==5 or nusecount==10 or nusecount==_GS_NUSECOUNT, "Currently only support nUSE Count = 40/5/10/" + str(_GS_NUSECOUNT) + ", received:" +  str(nusecount)
+    # nusecount==_GS_NUSECOUNT: GWat uses 5 positions (same as nusecount==5), GS uses the remaining slots
     if nusecount==40:
         num_selectable_elem = 40
         num_possible_item_per_elem = 2
     elif nusecount==10:
         num_selectable_elem = 10
         num_possible_item_per_elem = 16
-    else:  # nusecount==5 or nusecount==64
+    else:  # nusecount==5 or nusecount==_GS_NUSECOUNT
         num_selectable_elem = 5
         num_possible_item_per_elem = 256
     if not is_valid_att:
@@ -183,19 +206,12 @@ def getpresig_fn(att_json, tag="001_000"):
             private_key = ec.generate_private_key(ec.SECP256R1())
             epk += private_key.public_key().public_bytes(Encoding.X962,PublicFormat.CompressedPoint)
             shared_key_arr.append(private_key.exchange(ec.ECDH(), raw_pk))
-    garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag)
 
     gs_circuit = None
-    if nusecount == 64:
-        gs_epk = b""
-        gs_shared_keys = []
-        for _ in range(1 + _GS_TAG_BITS * 2):
-            priv = ec.generate_private_key(ec.SECP256R1())
-            gs_epk += priv.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
-            gs_shared_keys.append(priv.exchange(ec.ECDH(), raw_pk))
-        gs_json = json.loads(generate_gs(water_parameter, gs_shared_keys, _GS_TAG_BITS))
-        gs_json["epk"] = urlsafe_b64encode(gs_epk).decode("ascii")
-        gs_circuit = gs_json
+    if nusecount == _GS_NUSECOUNT:
+        garble_msg, gs_circuit = _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag)
+    else:
+        garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag)
 
     return garble_msg, epk, gs_circuit
 
@@ -203,7 +219,7 @@ def getpresig_fn(att_json, tag="001_000"):
 def _garble_one_circuit(raw_pk, tag):
     """Garble one Waters circuit (GWat + GS) for a single AndroidKeyStore pubkey and tag.
 
-    Always generates the GS circuit (57 slots) alongside GWat (5 positions × 256 items),
+    Always generates the GS circuit (1 + 2 × _GS_TAG_BITS slots) alongside GWat (5 positions × 256 items),
     so the returned circuit supports both Pay and offline Re-delegate.
     Returns (epk_bytes, garble_msg, gs_circuit_dict).
     """
@@ -217,18 +233,7 @@ def _garble_one_circuit(raw_pk, tag):
             priv = ec.generate_private_key(ec.SECP256R1())
             epk += priv.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
             shared_key_arr.append(priv.exchange(ec.ECDH(), raw_pk))
-    garble_msg = garble_waters(
-        water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag
-    )
-
-    gs_epk = b""
-    gs_shared_keys = []
-    for _ in range(1 + _GS_TAG_BITS * 2):
-        priv = ec.generate_private_key(ec.SECP256R1())
-        gs_epk += priv.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
-        gs_shared_keys.append(priv.exchange(ec.ECDH(), raw_pk))
-    gs_json = json.loads(generate_gs(water_parameter, gs_shared_keys, _GS_TAG_BITS))
-    gs_json["epk"] = urlsafe_b64encode(gs_epk).decode("ascii")
+    garble_msg, gs_json = _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag)
 
     return epk, garble_msg, gs_json
 
@@ -238,14 +243,14 @@ def _garble_one_circuit(raw_pk, tag):
 def getpresig():
     att_json = json.loads((request.args.get('attestation')))
     is_valid_att, targetpk, nusecount = verify_attestation(json.loads(request.args.get('attestation'))["att"])
-    assert nusecount==40 or nusecount==5 or nusecount==10 or nusecount==64, "Currently only support nUSE Count = 40/5/10/64, received:" +  str(nusecount)
+    assert nusecount==40 or nusecount==5 or nusecount==10 or nusecount==_GS_NUSECOUNT, "Currently only support nUSE Count = 40/5/10/" + str(_GS_NUSECOUNT) + ", received:" +  str(nusecount)
     if nusecount==40:
         num_selectable_elem = 40
         num_possible_item_per_elem = 2
     elif nusecount==10:
         num_selectable_elem = 10
         num_possible_item_per_elem = 16
-    else:  # nusecount==5 or nusecount==64
+    else:  # nusecount==5 or nusecount==_GS_NUSECOUNT
         num_selectable_elem = 5
         num_possible_item_per_elem = 256
 
@@ -262,19 +267,12 @@ def getpresig():
             shared_key_arr.append(private_key.exchange(ec.ECDH(), raw_pk))
     denomination = int(request.args.get('denomination', 1))
     cfg = denomination_config(denomination)
-    garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, cfg["tag"])
 
     gs_circuit = None
-    if nusecount == 64:
-        gs_epk = b""
-        gs_shared_keys = []
-        for _ in range(1 + _GS_TAG_BITS * 2):
-            priv = ec.generate_private_key(ec.SECP256R1())
-            gs_epk += priv.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
-            gs_shared_keys.append(priv.exchange(ec.ECDH(), raw_pk))
-        gs_json = json.loads(generate_gs(water_parameter, gs_shared_keys, _GS_TAG_BITS))
-        gs_json["epk"] = urlsafe_b64encode(gs_epk).decode("ascii")
-        gs_circuit = gs_json
+    if nusecount == _GS_NUSECOUNT:
+        garble_msg, gs_circuit = _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, cfg["tag"])
+    else:
+        garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, cfg["tag"])
 
     # Bank locks ETH in HTLC — this card now represents a redeemable coin
     contract_id_hex = ""
@@ -437,11 +435,12 @@ def replenish():
     """Batch-issue Waters dmks to top up Alice's wallet to her target coin counts.
 
     Body: {
-        "attestation": { "att": [...] },
+        "attestations": [{ "att": [...] }, ...],   # one per coin, in request order
         "request": [{"denomination": N, "count": K}, ...]
     }
-    nusecount in the attestation must equal 64 × total_count — one AndroidKeyStore key
-    covers the whole batch; each circuit uses a distinct ephemeral epk set.
+    Each coin gets its own AndroidKeyStore key with nusecount == _GS_NUSECOUNT. A shared key
+    with a pooled budget would let a client leave one coin unused and spend its ECDH uses on
+    opening both slots of another coin's GS bits.
     Returns: {
         "params": "<Waters public params JSON, beta_secret stripped>",
         "circuits": [{"denomination", "contract_id", "epk", "msg", "gs_circuit"}, ...]
@@ -453,12 +452,17 @@ def replenish():
     if total_count == 0:
         return jsonify({'error': 'no checks requested'}), 400
 
-    is_valid_att, raw_pk, nusecount = verify_attestation(body['attestation']['att'])
-    if not is_valid_att:
-        return jsonify({'error': 'invalid attestation'}), 400
-    expected_nusecount = 64 * total_count
-    if nusecount != expected_nusecount:
-        return jsonify({'error': f'nusecount {nusecount} != 64 × {total_count} = {expected_nusecount}'}), 400
+    attestations = body.get('attestations', [])
+    if len(attestations) != total_count:
+        return jsonify({'error': f'{len(attestations)} attestations for {total_count} coins (need one key per coin)'}), 400
+    raw_pks = []
+    for att in attestations:
+        is_valid_att, raw_pk, nusecount = verify_attestation(att['att'])
+        if not is_valid_att:
+            return jsonify({'error': 'invalid attestation'}), 400
+        if nusecount != _GS_NUSECOUNT:
+            return jsonify({'error': f'nusecount {nusecount} != {_GS_NUSECOUNT}'}), 400
+        raw_pks.append(raw_pk)
 
     params_public = json.loads(water_parameter)
     params_public.pop('beta_secret', None)
@@ -469,7 +473,7 @@ def replenish():
         count = int(req['count'])
         cfg = denomination_config(denomination)
         for _ in range(count):
-            epk, garble_msg, gs_circuit = _garble_one_circuit(raw_pk, cfg['tag'])
+            epk, garble_msg, gs_circuit = _garble_one_circuit(raw_pks[len(circuits)], cfg['tag'])
             circuits.append({
                 'denomination': denomination,
                 'contract_id': "",
@@ -622,8 +626,7 @@ def verify_attestation(att):
             if isinstance(value, list):
                 value = value[0] if value else 0
             keycount = int(value)
-            # Existing single-circuit values + any positive multiple of 64 (for batch replenish: 128, 192, 320, ...)
-            if keycount in {1, 5, 10, 20, 32, 40, 64, 160, 256} or (keycount > 0 and keycount % 64 == 0):
+            if keycount in {1, 5, 10, 20, 32, 40, 64, 160, 256, _GS_NUSECOUNT}:
                 has_valid_property = True
         read_result = decoder.read()
         if read_result!=None:
@@ -1087,6 +1090,82 @@ def test_redelegate_full():
         nusecount, num_possible_item_per_elem
     )
     print("RDelegate full test PASSED: Bob's Waters key verified")
+
+
+def test_gs_full():
+    """End-to-end test of the masked, all-or-nothing GS circuit linked to GWat.
+
+    Simulates the device with one secp256r1 key and counts its ECDH uses against _GS_NUSECOUNT.
+    Run: python3 -c "from server import test_gs_full; test_gs_full()"
+    """
+    import secrets
+    assert 5 + 1 + _GS_TAG_BITS == _GS_NUSECOUNT, "budget must be exact: GWat 5 + GS branch 1 + tag bits"
+
+    device = ec.generate_private_key(ec.SECP256R1())
+    uses = [0]
+    def ecdh(epk_bytes, idx):
+        uses[0] += 1
+        pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), epk_bytes[idx * 33:(idx + 1) * 33])
+        return device.exchange(ec.ECDH(), pub)
+
+    def gs_eval(gs, tag, keys, gwat_sk2, gwat_sk3):
+        return test_evaluate_gs(json.dumps(gs), tag, b"".join(keys), gwat_sk2, gwat_sk3)
+
+    def gs_keys(gs_epk, tag, override=None):
+        """Branch key + one key per tag bit; override maps bit index -> key used instead."""
+        bits = [(tag.encode()[i // 8] >> (i % 8)) & 1 for i in range(len(tag) * 8)]
+        keys = [ecdh(gs_epk, 0)]
+        for i, b in enumerate(bits):
+            keys.append(override[i] if override and i in override else ecdh(gs_epk, 1 + 2 * i + b))
+        return keys
+
+    def mint():
+        epk, garble_msg, gs = _garble_one_circuit(device.public_key(), make_tag(1, 0))
+        return epk, garble_msg, gs, urlsafe_b64decode(gs["epk"])
+
+    # --- Honest flow: activate (GWat, 5 uses) then re-delegate once (GS, 1 + 88 uses) ---
+    epk, garble_msg, gs, gs_epk = mint()
+    pattern = [secrets.randbelow(256) for _ in range(5)]
+    gwat_keys = [ecdh(epk, i * 256 + v) for i, v in enumerate(pattern)]
+    sk1, sk2, sk3 = test_rdelegate_local(water_parameter, garble_msg, gwat_keys, pattern, 5, 256)
+
+    bob_tag = "002_001_000"
+    ak2 = gs_eval(gs, bob_tag, gs_keys(gs_epk, bob_tag), sk2, sk3)
+    assert test_verify_gs_key(water_parameter, bob_tag, *ak2), "honest GS key must verify"
+    assert not test_verify_gs_key(water_parameter, "002_001_001", *ak2), "key must not verify for another tag"
+    assert uses[0] == _GS_NUSECOUNT, f"honest flow used {uses[0]} ECDH ops, budget is {_GS_NUSECOUNT}"
+    print(f"[ok] honest activate + re-delegate: key verifies for {bob_tag}, {uses[0]} ECDH uses")
+
+    # --- GS without this coin's GWat key (skipping activation to save 5 uses) fails ---
+    _, garble_msg_b, gs_b, gs_epk_b = mint()
+    try:
+        gs_eval(gs_b, bob_tag, gs_keys(gs_epk_b, bob_tag), sk2, sk3)  # GWat key of the other coin
+        raise AssertionError("GS opened with another coin's GWat key")
+    except OSError as e:
+        print(f"[ok] GS with another coin's GWat key rejected: {e}")
+
+    # --- Opening both slots of bit k leaves the budget one short: some bit j goes unopened ---
+    # With 94 uses: GWat 5 + branch 1 + both slots of bit k (2) + 86 other bits = 94, so bit j
+    # has no key and nothing decrypts, for either value of bit k.
+    epk_c, garble_msg_c, gs_c, gs_epk_c = mint()
+    pattern = [secrets.randbelow(256) for _ in range(5)]
+    _, sk2_c, sk3_c = test_rdelegate_local(water_parameter, garble_msg_c, [ecdh(epk_c, i * 256 + v) for i, v in enumerate(pattern)], pattern, 5, 256)
+    k, j = 3, 40
+    tag0 = "002_001_000"
+    tag1 = tag0[:k // 8] + chr(ord(tag0[k // 8]) ^ (1 << (k % 8))) + tag0[k // 8 + 1:]  # tag0 with bit k flipped
+    for tag in (tag0, tag1):
+        try:
+            gs_eval(gs_c, tag, gs_keys(gs_epk_c, tag, override={j: secrets.token_bytes(32)}), sk2_c, sk3_c)
+            raise AssertionError("GS evaluated with an unopened bit slot")
+        except OSError:
+            pass
+    print("[ok] evaluation with any bit slot unopened fails (no second tag from spare uses)")
+
+    # --- Fresh randomness per coin: circuits for the same device and tag differ ---
+    assert gs["base_enc"] != gs_b["base_enc"] and gs["slots_c1"][0] != gs_b["slots_c1"][0]
+    assert json.loads(garble_msg)["sig2"] != json.loads(garble_msg_b)["sig2"]
+    print("[ok] two coins get independent GS masks and GWat r")
+    print("GS full test PASSED")
 
 
 def main():

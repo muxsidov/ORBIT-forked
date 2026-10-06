@@ -354,11 +354,54 @@ fn water_derive_ak(param_str: String, tag: String) -> PyResult<String> {
     Ok(format!("{{\"sk1\":\"{}\",\"sk2\":\"{}\",\"sk3\":\"{}\"}}", sk1_hex, sk2_hex, sk3_hex))
 }
 
+fn pylist_to_bytes(list: &'_ Bound<'_, PyList>) -> Vec<Vec<u8>> {
+    list.iter()
+        .map(|item| item.downcast::<PyBytes>().unwrap().as_bytes().to_vec())
+        .collect()
+}
+
+// Secret that ties a coin's GS circuit to its GWat circuit: only a device that evaluated GWat
+// (spending its 5 ECDH uses) learns sk2 = g^r, sk3 = g2^r and can derive the GS all-or-nothing
+// key. Plays the role of the paper's rtag from Activate. Must match gs_link() in the Android
+// pbcrypto.rs.
+fn gs_link(sk2_bytes: &[u8], sk3_bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ORBIT-GS-LINK");
+    hasher.update(sk2_bytes);
+    hasher.update(sk3_bytes);
+    hasher.finalize().into()
+}
+
 #[pyfunction]
 fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_message_size: usize, MAX_ITEM: usize, tag: String) -> PyResult<String> {
+    let (paybox_json, _) = garble_waters_core(&param, pylist_to_bytes(shared_key_list), garble_message_size, MAX_ITEM, tag);
+    Ok(paybox_json)
+}
+
+// Mint one coin: GWat (activation) and GS (re-delegation) circuits, linked so that GS can only be
+// opened after GWat. Returns (gwat_json, gs_json).
+#[pyfunction]
+fn garble_waters_with_gs(
+    param: String,
+    shared_key_list: &'_ Bound<'_, PyList>,
+    garble_message_size: usize,
+    MAX_ITEM: usize,
+    tag: String,
+    gs_shared_key_list: &'_ Bound<'_, PyList>,
+    tag_bits: usize,
+) -> PyResult<(String, String)> {
+    let (paybox_json, link) = garble_waters_core(&param, pylist_to_bytes(shared_key_list), garble_message_size, MAX_ITEM, tag);
+    let gs_json = generate_gs_core(&param, pylist_to_bytes(gs_shared_key_list), tag_bits, &link);
+    Ok((paybox_json, gs_json))
+}
+
+// Returns (PaymentBox JSON, gs_link of its sk2/sk3).
+fn garble_waters_core(param: &str, shared_key_byte: Vec<Vec<u8>>, garble_message_size: usize, MAX_ITEM: usize, tag: String) -> (String, [u8; 32]) {
     let test = false;
-    let param: ParamWaters = serde_json::from_str(&param).unwrap();
-    let mut rng = ark_std::test_rng();
+    let param: ParamWaters = serde_json::from_str(param).unwrap();
+    // Per-coin secrets (r, masks, AoN shares): must be fresh. test_rng() is a fixed seed and
+    // would give every coin the same r and masks.
+    let mut rng = rand::thread_rng();
     let g = param.g;
     let g_alpha = param.g_alpha;
     let g2 = param.g2;
@@ -437,13 +480,6 @@ fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_
 
     // TODO: enable one-use key benchmark need to make the aon_key_bytes come from chosen_key_bytes, then encrypt correctly.
     // All keys are derived using method of AoN at server.py
-    let shared_key_byte: Vec<Vec<u8>> = shared_key_list
-    .iter()
-    .map(|item| {
-        let byte_arr = item.downcast::<PyBytes>().unwrap().as_bytes();
-        byte_arr.to_vec()
-    })
-    .collect();
     let mut aon_key_share_bytes: Vec<Vec<u8>> = Vec::new();
     let mut aon_key_bytes: [u8;32] = [0 as u8;32];
     for i in 0..garble_message_size{
@@ -508,70 +544,126 @@ fn garble_waters(param: String, shared_key_list:  &'_ Bound<'_, PyList>, garble_
     // let encoded = general_purpose::URL_SAFE_NO_PAD.encode(&json_string);
     // let _test_deserialize: PaymentBox = serde_json::from_str(&json_string).unwrap();
   
-    Ok(json_string)
+    (json_string, gs_link(&sig_2_byte, &sig_3_byte))
 }
 
 // Generate a GS circuit: a linear garbled binary circuit that evaluates to the Waters
-// activation key for any tag provided at re-delegation time.  Called by the server alongside
-// garble_waters so Alice can re-delegate offline without needing beta_secret.
+// activation key for one tag chosen at re-delegation time (paper Fig. 4, Waters branch).
+// Called via garble_waters_with_gs so the circuit is linked to the coin's GWat circuit.
 //
-// gs_shared_key_list: 1 branch key + TAG_BITS*2 bit-slot keys (bit=0 key, bit=1 key per bit).
-// Output JSON: {base_enc, slots_c0, slots_c1} — Alice's device adds the epk separately.
+// shared_keys: 1 branch key + tag_bits*2 bit-slot keys (bit=0 key, bit=1 key per bit).
+// link: gs_link(sk2, sk3) of the coin's GWat key.
+//
+// Two layers, as in the paper:
+//   - Masking: random G1 shares s_1..s_l with s_0 = -Σ s_i. Slot (i,0) holds s_i, slot (i,1)
+//     holds u_i·r + s_i, the base holds msk + u'·r + s_0. A single slot reveals nothing about
+//     u_i·r; only one full selection of slots sums to a valid dk1.
+//   - All-or-nothing: AoN key a = H(link) ⊕ a_0 ⊕ a_1 ⊕ … ⊕ a_l. The branch slot carries a_0,
+//     each bit slot (i,β) carries (a_i || b_iβ) under its ECDH key; the share in slot (i,β) is
+//     encrypted under H(a || b_iβ) and the base under a. Nothing decrypts unless the GWat
+//     link, the branch and one slot per bit were all opened. With nusecount = 5 (GWat) + 1 + l,
+//     opening both slots of any bit leaves some other bit unopened, so no key can be derived.
+//
+// Output JSON (Alice's device adds the epk separately):
+//   {base_key_mat, base_enc, key_mat0[i], key_mat1[i], slots_c0[i], slots_c1[i]}  (hex)
 //
 // Evaluation (Android JNI evaluate_gs):
-//   dk1 = Decrypt(base_enc) + Σ Decrypt(slots_c{btag_i}[i])   (G1 addition)
-//   dk2, dk3 = from base_enc
-#[pyfunction]
-fn generate_gs(
-    param_str: String,
-    gs_shared_key_list: &'_ Bound<'_, PyList>,
-    tag_bits: usize,
-) -> PyResult<String> {
-    let param: ParamWaters = serde_json::from_str(&param_str).unwrap();
-    let mut rng = ark_std::test_rng();
+//   a = H(link) ⊕ Dec_kbranch(base_key_mat) ⊕ Σ_i a_i,   (a_i, b_i) = Dec_ki(key_mat{btag_i}[i])
+//   dk1 = Dec_a(base_enc).dk1 + Σ_i Dec_{H(a||b_i)}(slots_c{btag_i}[i])   (G1 addition)
+//   dk2, dk3 = from Dec_a(base_enc)
+const GS_CHECK_LEN: usize = 16;
+
+fn generate_gs_core(param_str: &str, shared_keys: Vec<Vec<u8>>, tag_bits: usize, link: &[u8; 32]) -> String {
+    let param: ParamWaters = serde_json::from_str(param_str).unwrap();
+    let mut rng = rand::thread_rng();
+    assert_eq!(shared_keys.len(), 1 + tag_bits * 2, "GS shared_keys count mismatch");
 
     let rand_r = ScalarField::rand(&mut rng);
     let msk = param.g_alpha * param.beta_secret;
-    let base_dk1 = msk + (param.h_0 * rand_r);
     let dk2 = param.g * rand_r;
     let dk3 = param.g2 * rand_r;
 
-    let mut base_dk1_bytes = Vec::new();
-    base_dk1.serialize_compressed(&mut base_dk1_bytes).unwrap();
-    let mut dk2_bytes = Vec::new();
-    dk2.serialize_compressed(&mut dk2_bytes).unwrap();
-    let mut dk3_bytes = Vec::new();
-    dk3.serialize_compressed(&mut dk3_bytes).unwrap();
-    // base_plaintext = base_dk1 (32B) || dk2 (32B) || dk3 (64B) = 128 bytes
-    let base_plaintext: Vec<u8> = [base_dk1_bytes.as_slice(), dk2_bytes.as_slice(), dk3_bytes.as_slice()].concat();
+    // Masking shares, summing to zero with s_0 folded into the base.
+    let shares: Vec<G> = (0..tag_bits).map(|_| G::rand(&mut rng)).collect();
+    let s_0 = -shares.iter().fold(G::zero(), |acc, s| acc + s);
+    let base_dk1 = msk + (param.h_0 * rand_r) + s_0;
 
-    let shared_keys: Vec<Vec<u8>> = gs_shared_key_list
-        .iter()
-        .map(|item| item.downcast::<PyBytes>().unwrap().as_bytes().to_vec())
-        .collect();
-    assert_eq!(shared_keys.len(), 1 + tag_bits * 2, "GS shared_keys count mismatch");
-
-    let base_enc = encrypt(&base_plaintext, &shared_keys[0], 0);
-
-    let mut zero_g1_bytes = Vec::new();
-    G::zero().serialize_compressed(&mut zero_g1_bytes).unwrap();
-
-    let mut slots_c0: Vec<String> = Vec::new();
-    let mut slots_c1: Vec<String> = Vec::new();
-    for i in 0..tag_bits {
-        let delta_i = param.h_vec[i] * rand_r;
-        let mut delta_i_bytes = Vec::new();
-        delta_i.serialize_compressed(&mut delta_i_bytes).unwrap();
-
-        slots_c0.push(hex::encode(encrypt(&zero_g1_bytes, &shared_keys[1 + 2 * i], 0)));
-        slots_c1.push(hex::encode(encrypt(&delta_i_bytes, &shared_keys[1 + 2 * i + 1], 0)));
+    // AoN shares a_0 (branch), a_1..a_l (bits); a = H(link) ⊕ all shares.
+    let mut aon_key = derive_key(b"ORBIT-GS-AON", link);
+    let mut aon_shares: Vec<[u8; 32]> = Vec::new();
+    for _ in 0..(1 + tag_bits) {
+        let mut a_i = [0u8; 32];
+        rng.fill(&mut a_i);
+        for j in 0..32 { aon_key[j] ^= a_i[j]; }
+        aon_shares.push(a_i);
     }
 
-    Ok(json!({
+    // base_plaintext = zero check value (16B) || base_dk1 (32B) || dk2 (32B) || dk3 (64B) = 144 bytes.
+    // The check value lets the evaluator detect a wrong AoN key instead of returning a garbage key.
+    let mut base_plaintext = vec![0u8; GS_CHECK_LEN];
+    base_dk1.serialize_compressed(&mut base_plaintext).unwrap();
+    dk2.serialize_compressed(&mut base_plaintext).unwrap();
+    dk3.serialize_compressed(&mut base_plaintext).unwrap();
+    let base_key_mat = encrypt(&aon_shares[0], &shared_keys[0], 0);
+    let base_enc = encrypt(&base_plaintext, &aon_key, 1);
+
+    let mut key_mat: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    let mut slots: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    for i in 0..tag_bits {
+        let a_i = &aon_shares[1 + i];
+        let bit1_share = param.h_vec[i] * rand_r + shares[i];
+        for (bit, share) in [shares[i], bit1_share].iter().enumerate() {
+            let mut b_ib = [0u8; 32];
+            rng.fill(&mut b_ib);
+            let k_ib = &shared_keys[1 + 2 * i + bit];
+            key_mat[bit].push(hex::encode(encrypt(&concat_two(a_i, &b_ib), k_ib, 0)));
+
+            let mut share_bytes = Vec::new();
+            share.serialize_compressed(&mut share_bytes).unwrap();
+            slots[bit].push(hex::encode(encrypt(&share_bytes, &derive_key(&aon_key, &b_ib), 0)));
+        }
+    }
+    let [key_mat0, key_mat1] = key_mat;
+    let [slots_c0, slots_c1] = slots;
+
+    json!({
+        "base_key_mat": hex::encode(base_key_mat),
         "base_enc": hex::encode(base_enc),
+        "key_mat0": key_mat0,
+        "key_mat1": key_mat1,
         "slots_c0": slots_c0,
         "slots_c1": slots_c1,
-    }).to_string())
+    }).to_string()
+}
+
+// Test-only: evaluate a GS circuit with the server-side copy of evaluate_gs (identical to the
+// Android JNI one), so the full mint → activate → re-delegate pipeline can be tested in Python.
+// shared_keys: flat bytes, branch key followed by one key per tag bit (chosen by the caller).
+#[pyfunction]
+fn test_evaluate_gs(gs_circuit_json: String, bob_tag: String, shared_keys: Vec<u8>, gwat_sk2: Vec<u8>, gwat_sk3: Vec<u8>) -> PyResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    pbcrypto::evaluate_gs(&gs_circuit_json, &bob_tag, &shared_keys, &gwat_sk2, &gwat_sk3)
+        .map_err(|e| PyOSError::new_err(e))
+}
+
+// Test-only: verify a Waters key against a tag in the GS string encoding (ASCII bytes,
+// LSB-first within each byte, bit i ↦ h_vec[i]). Checks both Waters equations.
+#[pyfunction]
+fn test_verify_gs_key(param_str: String, tag: String, sk1: Vec<u8>, sk2: Vec<u8>, sk3: Vec<u8>) -> PyResult<bool> {
+    let param: ParamWaters = serde_json::from_str(&param_str).unwrap();
+    let (Ok(sk1), Ok(sk2), Ok(sk3)) = (
+        G::deserialize_compressed(&sk1[..]),
+        G::deserialize_compressed(&sk2[..]),
+        G2::deserialize_compressed(&sk3[..]),
+    ) else { return Ok(false) };
+    let mut h = param.h_0;
+    for (byte_idx, byte) in tag.as_bytes().iter().enumerate() {
+        for bit in 0..8 {
+            if (byte >> bit) & 1 == 1 { h += param.h_vec[byte_idx * 8 + bit]; }
+        }
+    }
+    let check1 = Bn254::pairing(param.g, sk3) == Bn254::pairing(sk2, param.g2);
+    let check2 = Bn254::pairing(param.g_alpha, param.g2_beta) + Bn254::pairing(h, sk3) == Bn254::pairing(sk1, param.g2);
+    Ok(check1 && check2)
 }
 
 // Alice runs this on her device to garble a Waters activation key for Bob without the server.
@@ -1326,7 +1418,9 @@ fn rustcode(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_params_ecdsa, m)?)?;
     m.add_function(wrap_pyfunction!(water_unlock_solidity, m)?)?;
     m.add_function(wrap_pyfunction!(water_derive_ak, m)?)?;
-    m.add_function(wrap_pyfunction!(generate_gs, m)?)?;
+    m.add_function(wrap_pyfunction!(garble_waters_with_gs, m)?)?;
+    m.add_function(wrap_pyfunction!(test_evaluate_gs, m)?)?;
+    m.add_function(wrap_pyfunction!(test_verify_gs_key, m)?)?;
     m.add_function(wrap_pyfunction!(decompress_waters_key, m)?)?;
     m.add_function(wrap_pyfunction!(garble_waters, m)?)?;
     m.add_function(wrap_pyfunction!(garble_redelegate, m)?)?;

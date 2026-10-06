@@ -1,0 +1,16 @@
+[package]
+name = "poc_adaptor_sig"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone crate, deliberately NOT part of `rustcode` — this is Part A of
+# CLAUDE_replace_HTLC.md, a crypto-only research POC with no PyO3/Python dependency,
+# so it can be iterated on and run with plain `cargo run --bin <name>` without touching
+# or risking the production `rustcode` extension build.
+
+[dependencies]
+ark-bn254 = "0.5"
+ark-ec = "0.5"
+ark-ff = "0.5"
+ark-std = "0.5"

@@ -345,7 +345,9 @@ contract HashedTimelockETH {
         withdrawable(_contractId)
         returns (bool)
     {
-        LockContract memory c = contracts[_contractId];
+        // storage, not memory: a memory copy would never persist withdrawn/preimage,
+        // letting the same contract be withdrawn repeatedly.
+        LockContract storage c = contracts[_contractId];
 
         c.preimage = _preimage;
         c.withdrawn = true;
@@ -371,7 +373,7 @@ contract HashedTimelockETH {
         refundable(_contractId)
         returns (bool)
     {
-        LockContract memory c = contracts[_contractId];
+        LockContract storage c = contracts[_contractId];
 
         c.refunded = true;
 

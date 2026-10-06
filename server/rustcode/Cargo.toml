@@ -30,3 +30,4 @@ sha3 = "0.10"
 # secq256r1={path = "../secq256r1"}
 num-bigint = {version="0.4.4", features = ["rand"]}
 hex = "0.4"
+rand = "0.8"

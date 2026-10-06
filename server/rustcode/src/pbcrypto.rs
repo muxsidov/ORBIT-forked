@@ -16,6 +16,7 @@ type Secp256r1Affine = Affine<Secp256r1Config>;
 
 use serde::{Serialize,Deserialize};
 use serde_json;
+use hex;
 
 use aes::{cipher, Aes128};
 use ctr::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
@@ -377,4 +378,88 @@ pub fn evaluate_ecdsa(params:String, key_mat_enc:Vec<Vec<u8>>, rtag:Vec<Vec<u8>>
 
     // debug!("{}", "Siganture OK");
 
+}
+
+// Must match gs_link() in the server's lib.rs.
+fn gs_link(sk2_bytes: &[u8], sk3_bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ORBIT-GS-LINK");
+    hasher.update(sk2_bytes);
+    hasher.update(sk3_bytes);
+    hasher.finalize().into()
+}
+
+#[derive(Deserialize)]
+struct GsCircuit {
+    base_key_mat: String,
+    base_enc: String,
+    key_mat0: Vec<String>,
+    key_mat1: Vec<String>,
+    slots_c0: Vec<String>,
+    slots_c1: Vec<String>,
+}
+
+const GS_CHECK_LEN: usize = 16;
+
+// Evaluate the GS circuit at bob_tag (see generate_gs_core in the server's lib.rs for the layout).
+//
+// shared_keys: flat byte array of (1 + numBits) × 32 bytes of AndroidKeyStore ECDH results:
+//   [0..32]                 = branch key → decrypts base_key_mat → a_0
+//   [(1+i)*32..(2+i)*32]    = key for bit i, against the epk selected by bob_tag bit i
+//                             → decrypts key_mat{bit}[i] → (a_i || b_i)
+// gwat_sk2, gwat_sk3: this coin's own activation key components from GWat; they form the link
+// that the AoN key a = H(link) ⊕ a_0 ⊕ … ⊕ a_l depends on.
+//
+// Returns (sk1_bytes, sk2_bytes, sk3_bytes) — Bob's Waters activation key.
+pub fn evaluate_gs(gs_circuit_json: &str, bob_tag: &str, shared_keys: &[u8], gwat_sk2: &[u8], gwat_sk3: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    let gs: GsCircuit = serde_json::from_str(gs_circuit_json).map_err(|e| format!("invalid gs_circuit: {e}"))?;
+    let unhex = |h: &str| hex::decode(h).map_err(|e| format!("invalid hex in gs_circuit: {e}"));
+
+    let tag_bytes = bob_tag.as_bytes();
+    let num_bits = tag_bytes.len() * 8;
+    if num_bits != gs.slots_c0.len() {
+        return Err(format!("tag has {} bits, circuit has {} (re-mint the coin)", num_bits, gs.slots_c0.len()));
+    }
+    if shared_keys.len() != (1 + num_bits) * 32 {
+        return Err(format!("expected {} shared keys, got {} bytes", 1 + num_bits, shared_keys.len()));
+    }
+    let key_at = |idx: usize| &shared_keys[idx * 32..(idx + 1) * 32];
+    let bit_of = |i: usize| (tag_bytes[i / 8] >> (i % 8)) & 1;
+
+    // Recover the AoN key from the link, the branch share and one share per tag bit.
+    let mut aon_key = derive_key(b"ORBIT-GS-AON", &gs_link(gwat_sk2, gwat_sk3));
+    let a_0 = decrypt(&unhex(&gs.base_key_mat)?, key_at(0), 0);
+    for j in 0..32 { aon_key[j] ^= a_0[j]; }
+    let mut b_vals: Vec<Vec<u8>> = Vec::with_capacity(num_bits);
+    for i in 0..num_bits {
+        let key_mat = if bit_of(i) == 0 { &gs.key_mat0[i] } else { &gs.key_mat1[i] };
+        let a_b = decrypt(&unhex(key_mat)?, key_at(1 + i), 0);
+        for j in 0..32 { aon_key[j] ^= a_b[j]; }
+        b_vals.push(a_b[32..64].to_vec());
+    }
+
+    let base_plain = decrypt(&unhex(&gs.base_enc)?, &aon_key, 1);
+    if base_plain[..GS_CHECK_LEN].iter().any(|&b| b != 0) {
+        return Err("GS all-or-nothing key mismatch (wrong ECDH keys, or GWat key not from this coin)".into());
+    }
+    let base = &base_plain[GS_CHECK_LEN..];
+    let g1 = |b: &[u8]| G::deserialize_with_mode(b, Compress::Yes, Validate::Yes).map_err(|e| format!("invalid G1: {e}"));
+    let mut dk1 = g1(&base[0..32])?;
+    let dk2 = g1(&base[32..64])?;
+    let dk3 = G2::deserialize_with_mode(&base[64..128], Compress::Yes, Validate::Yes).map_err(|e| format!("invalid G2: {e}"))?;
+
+    // Add the masked per-bit shares; the masks cancel only over one full selection.
+    for i in 0..num_bits {
+        let slot = if bit_of(i) == 0 { &gs.slots_c0[i] } else { &gs.slots_c1[i] };
+        dk1 += g1(&decrypt(&unhex(slot)?, &derive_key(&aon_key, &b_vals[i]), 0))?;
+    }
+
+    let mut sk1_bytes = Vec::new();
+    dk1.serialize_compressed(&mut sk1_bytes).unwrap();
+    let mut sk2_bytes = Vec::new();
+    dk2.serialize_compressed(&mut sk2_bytes).unwrap();
+    let mut sk3_bytes = Vec::new();
+    dk3.serialize_compressed(&mut sk3_bytes).unwrap();
+
+    Ok((sk1_bytes, sk2_bytes, sk3_bytes))
 }
