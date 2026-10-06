@@ -13,8 +13,7 @@ with a pairing precompile. See `CLAUDE_AandFD.md` for the paper background this 
 ## Motivation
 
 Current `zfairexchange.sol` requires the chain to evaluate a full BN254 pairing check
-(`e(...) = e(...)`) on-chain to verify a submitted `(sk1,sk2,sk3)` — see "Waters Activation
-Key Structure" in `CLAUDE.md`. This ties ORBIT to chains with a pairing precompile
+(`e(...) = e(...)`) on-chain to verify a submitted `(sk1,sk2,sk3)` — see "Waters activation key" in `CLAUDE_crypto.md`. This ties ORBIT to chains with a pairing precompile
 (effectively just Ethereum/EVM via `alt_bn128`).
 
 Professor's suggestion: replace the on-chain pairing check with an **adaptor-signature-style
@@ -38,7 +37,7 @@ Bitcoin/Monero-style atomic swaps ("scriptless scripts").
 
 ## Core idea: ElGamal-encrypt sk3 under an adaptor statement
 
-Waters activation key recap (BN254 Type-3 pairing, see `CLAUDE.md`):
+Waters activation key recap (BN254 Type-3 pairing, see `CLAUDE_crypto.md`):
 `sk1 = g^α·H(tag)^r ∈ G1`, `sk2 = g^r ∈ G1`, `sk3 = g2^r ∈ G2`.
 
 Only `sk3` needs protection — it's the component the pairing check isolates against `g2`.
@@ -67,26 +66,44 @@ needed on-chain at all. `Y_bn254` is used only off-chain, by Alice, to verify th
 ciphertext before she locks any funds. Once the Bank reveals `x` on-chain (via `Adapt`/`Extract`
 on the adaptor signature), Alice recovers `H(x) mod r` and can decrypt — see Step 5 below.
 
-**ElGamal ciphertext of sk3**, masked multiplicatively under `Y_bn254` (no need for exponential
-ElGamal since `sk3` is already a group element, not a scalar):
+**ElGamal ciphertext of sk3**, masked additively (group operation) under `Y_bn254` (no need for
+exponential ElGamal since `sk3` is already a group element, not a scalar):
 ```
 c1 := g2^b                (fresh random b)
 c2 := Y_bn254^b · sk3
 ```
+Both `Y_bn254`, `c1`, `c2`, `sk3` live in `G2` — this part is group-type-consistent and its
+round trip (mask with a known `x`, later decrypt with it) is **confirmed working in code**, see
+`thesis_log/elgamal-sk3-veck.md`, Step 1 (`server/poc_adaptor_sig/src/bin/step1_baseline_elgamal.rs`).
 
-**Verification identity** (confirmed algebraically — bilinearity, holds for any b, Y_bn254, sk3):
-```
-e(s3, g2) = e(Y_bn254, c1)^{-1} · e(c2, g2)
-```
-Derivation: `e(Y_bn254, g2^{-b}) · e(Y_bn254^b·s3, g2) = e(Y_bn254,g2)^{-b} · e(Y_bn254,g2)^{b} ·
-e(s3,g2) = e(s3,g2)`.
+**Verification identity — corrected, still being validated (do not treat as settled).** An
+earlier version of this doc claimed `e(s3,g2) = e(Y_bn254,c1)^{-1}·e(c2,g2)`, which does **not**
+type-check: BN254 here is a Type-3 asymmetric pairing (`e: G1 × G2 → GT`, confirmed by every
+pairing call in `server/rustcode/src/lib.rs`), and `Y_bn254`, `c1` both live in `G2` — there is
+no defined `e(G2, G2)` operation, and no efficient map from `G2` to `G1` (that asymmetry is the
+whole point of using a Type-3 curve). See `thesis_log/elgamal-sk3-veck.md`'s first 2026-08-12
+entry for the full writeup of this bug and why it went unnoticed until implementation.
 
-This means: **`e(sk3, g2)` — exactly what the Waters pairing check needs — is computable from
-`(Y, c1, c2, g2)` alone, without ever learning `sk3`.** The recipient plugs this into the
-existing Waters equations (`e(vk1,vk2)·e(H(m),sk2) = e(sk3,g2)` in the professor's generic
-notation, corresponding to the two checks under "Waters Activation Key Structure" in
-`CLAUDE.md`) and confirms they hold — while `sk3` stays hidden. This is the pre-signature /
-verifiable-encryption stage: checkable, but not yet usable.
+**Current hypothesis (not yet fully confirmed):** publish a *second*, independent commitment to
+the same secret `x` — this time in `G1`: `Y_G1 := g^x`. Then, using only public values
+(`c1`, `c2`, `Y_G1`, `g`, `sk2`, `param.g2`), bilinearity gives:
+```
+e(g, c2) = e(g, Y_bn254^b) · e(g, sk3) = e(Y_G1, c1) · e(g, sk3)
+  ⇒  e(g, sk3) = e(g, c2) · e(Y_G1, c1)^{-1}
+```
+which lets Alice check Waters check 1 (`e(sk2,g2) == e(g,sk3)`) as
+`e(sk2,g2) == e(g,c2)·e(Y_G1,c1)^{-1}` — computable entirely from public values, without ever
+learning `sk3` or `x`. This is Step 2 of Part A, not yet implemented/confirmed.
+
+**Known open risk:** Waters check 2 (`e(g_alpha,g2_beta)·e(h_tag,sk3) == e(sk1,g2)`) may **not**
+reduce the same way — the trick above only eliminates `x` from pairings whose `G1` argument is
+`g` itself (because `Y_G1 = g^x`, so `e(g,·)^x = e(Y_G1,·)`); `h_tag` is an independent `G1`
+generator unrelated to `g`, so `e(h_tag,·)^x` can't obviously be rewritten the same way without
+also publishing `h_tag^x` (or a per-tag commitment), which the Bank can't precompute since
+`h_tag` depends on the recipient's tag. If this doesn't resolve cleanly, the full
+verifiable-encryption property may need a proper NIZK (e.g. Groth-Sahai proofs — literally
+designed for proving pairing-product equations about committed group elements) rather than a
+one-shot pairing trick. Track resolution in `thesis_log/elgamal-sk3-veck.md`.
 
 ## Full protocol (Bank ↔ Alice)
 
@@ -126,8 +143,7 @@ the identical primitive:
    bonding-transaction shape as Step 3 above), and once his transaction reveals `x_Bob`,
    decrypts `sk3` the same way Alice did.
 
-This replaces the current GS-circuit-based offline re-delegation (57 AndroidKeyStore ECDH
-ops, see "GS Circuit" section in `CLAUDE.md`) with the same atomic-fair-exchange primitive
+This replaces the current GS-circuit-based offline re-delegation (89 AndroidKeyStore ECDH ops since the 88-bit tag change, see "GS — the re-delegation circuit" in `CLAUDE_crypto.md`) with the same atomic-fair-exchange primitive
 used for activation. It's cryptographically equivalent to today's "Option A" (Bob reuses
 Alice's exact `(sk1,sk2,sk3)`), except the handoff becomes atomic and fair by construction —
 Bob can't be cheated out of a decryptable `sk3` without Alice getting paid, and vice versa —
@@ -161,8 +177,7 @@ touching any blockchain or Android code:
 5. "Reveal" `x` (simulate the on-chain step — no actual chain involved yet), recompute
    `H(x) mod r`, decrypt `sk3' = c2 · c1^{-H(x)}`, assert `sk3' == sk3`.
 6. Assert the recovered `(sk1, sk2, sk3')` still passes both existing Waters pairing checks
-   (`e(g,sk3)==e(sk2,g2)` and the main verification equation — see "Waters Activation Key
-   Structure" in `CLAUDE.md`).
+   (`e(g,sk3)==e(sk2,g2)` and the main verification equation — see "Waters activation key" in `CLAUDE_crypto.md`).
 
 This is the step with actual research risk — confirms the two-hop witness (one secret scalar,
 two unrelated group commitments) is sound before any chain-specific work starts. Zero
@@ -195,8 +210,7 @@ transaction for real:
 - Server: new endpoint(s) analogous to `/api/delegatedpresig`/`/api/pay`, but returning
   `(Y_chain, Y_bn254, c1, c2)` instead of the current unmasked flow, plus whatever pre-signature
   material the chosen adaptor scheme needs from the Bank.
-- Compare against the `beta_secret` stripping fix already done for the current design (see
-  `CLAUDE.md`) — this design likely also removes any need to send `beta_secret`-derived
+- Compare against the `beta_secret` stripping fix already done for the current design (see `CLAUDE_crypto.md`) — this design likely also removes any need to send `beta_secret`-derived
   material to Alice, since she decrypts a Bank-prepared ciphertext rather than re-deriving
   `sk3` herself. Confirm once Part A/B are working.
 - Re-delegation (Alice → Bob) reuses the identical primitive per the "Re-delegation for free"

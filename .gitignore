@@ -3,9 +3,11 @@ server/.venv/
 .ipynb_checkpoints/
 __pycache__/
 *.pyc
+*:Zone.Identifier
 
 # Rust build artifacts
 server/rustcode/target/
+server/poc_adaptor_sig/target/
 
 # Node
 node_modules/

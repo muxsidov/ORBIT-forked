@@ -2,7 +2,7 @@
 
 Reference summary of `ORBIT.pdf` ("ORBIT: One-Shot Re-Delegatable Signatures for Scalable Off-Chain Payments", anonymous submission to ACM CCS 2025). Read this instead of re-reading the PDF for questions about the paper's design, formal definitions, or algorithms.
 
-For how these concepts map onto the actual code in this repo (Rust functions, endpoints, Android flow, and where the implementation *deviates* from the paper), see `CLAUDE.md` — this file stays paper-only so the two don't drift out of sync.
+For how these concepts map onto the actual code in this repo (Rust functions, endpoints, Android flow, and where the implementation *deviates* from the paper), see `CLAUDE_crypto.md` and `CLAUDE_architecture.md` — this file stays paper-only so the two don't drift out of sync.
 
 ## Core idea
 
@@ -32,7 +32,7 @@ ORBIT is defined relative to an underlying signature scheme `DS = (KeyGen, Sign,
 | `DSign(osk, skD, m)` | → `σ` | delegatee spends the one-shot key to sign message `m` under `DS` |
 | `VerifyD(dmk, tag, pk, pkD)` | → `0/1` | (verifiability extension) checks a dormant key is well-formed before activation |
 
-**Critical point for "can RDelegate happen without Activate":** `RDelegate` takes `osk` (the *output* of `Activate`) as a formal input — there is no algorithm that goes directly from `dmk` to a re-delegation. So per the paper, no — activation is a hard prerequisite for re-delegation. (See CLAUDE.md's "GS Circuit" section for how this repo's actual implementation approximates this differently.)
+**Critical point for "can RDelegate happen without Activate":** `RDelegate` takes `osk` (the *output* of `Activate`) as a formal input — there is no algorithm that goes directly from `dmk` to a re-delegation. So per the paper, no — activation is a hard prerequisite for re-delegation. (See "GS — the re-delegation circuit" in `CLAUDE_crypto.md` for how this repo's actual implementation approximates this differently.)
 
 ### Correctness chain (Definition 4.2)
 
@@ -141,7 +141,7 @@ GS = ( cak,                                    # Waters-IBE ciphertext of rtag u
 
 ### Efficiency knob: word size `w`
 
-Bit-wise decomposition (`w=1`) can be generalized to word-size decomposition (`w>1`, e.g. bytes), trading more delegator-side computation (Delegate) for `ℓm/w` fewer client-side operations. The paper benchmarks both `w=1` and `w=8`. (This repo's `garble_waters`/`garble_redelegate` use `MAX_ITEM=256` i.e. `w=8` byte-wise decomposition — see CLAUDE.md.)
+Bit-wise decomposition (`w=1`) can be generalized to word-size decomposition (`w>1`, e.g. bytes), trading more delegator-side computation (Delegate) for `ℓm/w` fewer client-side operations. The paper benchmarks both `w=1` and `w=8`. (This repo's `garble_waters`/`garble_redelegate` use `MAX_ITEM=256` i.e. `w=8` byte-wise decomposition — see `CLAUDE_crypto.md`.)
 
 ### Optimization: split tag length from message length
 
