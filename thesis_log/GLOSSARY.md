@@ -63,6 +63,32 @@ each time. Canonical, fuller definitions live in `CLAUDE_crypto.md` / `CLAUDE_ar
   paper implicitly assumes.
 - **XDH assumption** — the hardness assumption a Type-3 pairing's G1/G2 asymmetry can provide;
   relevant to the ElGamal-in-G2 VECK design (`elgamal-sk3-veck.md`).
+- **G1 / G2 / GT** — BN254's two source groups and target group of `e: G1 × G2 → GT`. `sk1`,
+  `sk2`, `h_tag` ∈ G1; `sk3` ∈ G2. Which object lives where: groups table in
+  `multichain-feasibility.md`.
+- **param.g / param.g2** — the Waters params' own G1/G2 generators (random elements, *not*
+  `G1::generator()`/`G2::generator()`); every VECK commitment must use these.
+- **G_chain** — the base point of the target chain's own signature curve (secp256k1 for
+  Bitcoin/EVM-ECDSA, ed25519 for Monero). Unrelated to BN254.
+- **x** — the Bank's (or seller's) secret witness; revealed on-chain when it claims payment.
+- **k** — the BN254 exponent that decrypts `sk3`; either `k = x` (recommended) or `k = H(x)`.
+- **Y_chain = x·G_chain** — adaptor-signature statement; the only value the chain sees.
+- **Y_bn254 = g2^k** — ElGamal public key in G2 masking `sk3`.
+- **Y_G1 = g^k** — G1 twin of `Y_bn254`; lets Alice verify Waters check 1 without decrypting.
+  Consistency check: `e(Y_G1, g2) == e(g, Y_bn254)`.
+- **T = h_tag^k** — per-tag hint letting Alice verify Waters check 2 without decrypting.
+- **(c1, c2) = (g2^b, Y_bn254^b · sk3)** — ElGamal ciphertext of `sk3`; `b` is fresh randomness.
+  Decrypts as `sk3 = c2 · c1^{-k}`.
+- **Waters check 1 / check 2** — `e(sk2,g2) == e(g,sk3)` and
+  `e(g_alpha,g2_beta)·e(h_tag,sk3) == e(sk1,g2)`; together they validate a Waters key.
+- **Cross-group DLEQ** — a zero-knowledge proof that two points on *different* curves (here
+  `Y_chain` and `Y_bn254`) share the same discrete log. Needed for multi-chain fairness;
+  requires `k = x`. Used in Monero↔Bitcoin atomic swaps.
+- **Adaptor signature** — a pre-signature that becomes a valid signature only with a secret
+  witness, and reveals that witness once published (`pSign`/`pVrfy`/`Adapt`/`Ext`; see
+  `CLAUDE_AandFD.md`). Lets any ECDSA/Schnorr chain enforce "pay whoever reveals `x`".
+- **Q1 / Q2 / Q3** — the three multi-chain feasibility sub-questions (verify without
+  decrypting / cross-curve link / pairing-free enforcement); see `multichain-feasibility.md`.
 
 ## Contract / on-chain terms
 

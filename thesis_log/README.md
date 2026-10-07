@@ -21,6 +21,23 @@ checked before decryption (Part A, Steps 1-2+, of `CLAUDE_replace_HTLC.md`).
   entry documents a caught derivation error before any code was written — good source material
   for a design-iteration/methodology subsection, not just the final result.
 
+### [Multi-Chain Feasibility](multichain-feasibility.md)
+Whether ORBIT's payment layer can work on chains without a BN254 pairing precompile (Bitcoin,
+Monero, …): the three sub-questions Parts A/B answer, and the groups each object lives in.
+- **Scope test:** the overall feasibility verdict and framing — what must hold for multi-chain
+  support. Individual cryptographic experiments go in `elgamal-sk3-veck.md` (Part A) or a Part B
+  file; record here only how their results change the verdict.
+- **Thesis use:** Introduction/Motivation (why leave Ethereum-only) and the opening of the
+  HTLC-replacement design chapter; the groups table is a ready-made figure.
+
+### [Test Results](test-results.md)
+Raw pass/fail tables of the research test programs (Part A Steps 1–3 so far): one row per case,
+with what it simulates, expected vs. observed, and the exact command/commit of each run.
+- **Scope test:** test outcomes only. The reasoning behind a result goes in the topic file
+  (`elgamal-sk3-veck.md`, `multichain-feasibility.md`); this file is the evidence table.
+- **Thesis use:** Evaluation chapter. The negative cases are the evidence for "a cheating Bank
+  is caught before Alice pays".
+
 ### [Denomination and Identity-QR Feature Review](denomination-and-identity-qr-review.md)
 Mapping the denomination system and scan/identity-QR re-delegation flow onto the paper's
 algorithms; surfaces that recipient identity in the current re-delegation path has no

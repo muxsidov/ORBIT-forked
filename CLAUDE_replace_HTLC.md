@@ -84,26 +84,55 @@ no defined `e(G2, G2)` operation, and no efficient map from `G2` to `G1` (that a
 whole point of using a Type-3 curve). See `thesis_log/elgamal-sk3-veck.md`'s first 2026-08-12
 entry for the full writeup of this bug and why it went unnoticed until implementation.
 
-**Current hypothesis (not yet fully confirmed):** publish a *second*, independent commitment to
-the same secret `x` — this time in `G1`: `Y_G1 := g^x`. Then, using only public values
-(`c1`, `c2`, `Y_G1`, `g`, `sk2`, `param.g2`), bilinearity gives:
-```
-e(g, c2) = e(g, Y_bn254^b) · e(g, sk3) = e(Y_G1, c1) · e(g, sk3)
-  ⇒  e(g, sk3) = e(g, c2) · e(Y_G1, c1)^{-1}
-```
-which lets Alice check Waters check 1 (`e(sk2,g2) == e(g,sk3)`) as
-`e(sk2,g2) == e(g,c2)·e(Y_G1,c1)^{-1}` — computable entirely from public values, without ever
-learning `sk3` or `x`. This is Step 2 of Part A, not yet implemented/confirmed.
+**Notation.** Write `k` for the BN254 exponent of the ElGamal key, so `Y_bn254 = g2^k` (today
+`k = H(x) mod r`; see "Cross-group link" below for why `k = x` may be preferable). All BN254
+values use the Waters params' own generators `param.g` (G1) and `param.g2` (G2) — these are
+random elements, **not** `G1::generator()`/`G2::generator()`.
 
-**Known open risk:** Waters check 2 (`e(g_alpha,g2_beta)·e(h_tag,sk3) == e(sk1,g2)`) may **not**
-reduce the same way — the trick above only eliminates `x` from pairings whose `G1` argument is
-`g` itself (because `Y_G1 = g^x`, so `e(g,·)^x = e(Y_G1,·)`); `h_tag` is an independent `G1`
-generator unrelated to `g`, so `e(h_tag,·)^x` can't obviously be rewritten the same way without
-also publishing `h_tag^x` (or a per-tag commitment), which the Bank can't precompute since
-`h_tag` depends on the recipient's tag. If this doesn't resolve cleanly, the full
-verifiable-encryption property may need a proper NIZK (e.g. Groth-Sahai proofs — literally
-designed for proving pairing-product equations about committed group elements) rather than a
-one-shot pairing trick. Track resolution in `thesis_log/elgamal-sk3-veck.md`.
+**Current hypothesis (not yet confirmed):** publish a second commitment to the *same exponent
+`k`*, this time in `G1`: `Y_G1 := param.g^k`. (An earlier draft wrote `Y_G1 = g^x`; with
+`Y_bn254 = g2^(H(x))` the exponents differ and the identity below fails unless `H(x) = x`.)
+
+Alice first checks the two commitments agree:
+```
+e(Y_G1, g2) == e(g, Y_bn254)                                  (consistency)
+```
+Then, writing `Dec := c2 · c1^{-k}` for what the ciphertext decrypts to:
+```
+e(g, c2) · e(Y_G1, c1)^{-1} = e(g, c2) · e(g, c1)^{-k} = e(g, Dec)
+```
+so Waters check 1 (`e(sk2,g2) == e(g,sk3)`) can be checked from public values only as
+```
+e(sk2, g2) == e(g, c2) · e(Y_G1, c1)^{-1}                    (check 1, encrypted)
+```
+Because `e(g, ·)` is injective on G2, this proves `Dec = g2^r` exactly (where `sk2 = g^r`), for
+*any* `c1` — no well-formedness proof for `c1` needed. Step 2 of Part A.
+
+**Waters check 2** (`e(g_alpha,g2_beta)·e(h_tag,sk3) == e(sk1,g2)`) needs `e(h_tag, Dec)`, and
+`h_tag` is not a power of `g`, so `Y_G1` doesn't help. `h_vec`/`h_0` exist only in G1
+(`ParamWaters`, `server/rustcode/src/lib.rs`), so there's no G2 twin to move the pairing onto
+`sk2` either. **Hypothesis:** the Bank additionally sends the per-tag hint `T := h_tag^k ∈ G1`
+(Alice's tag is known at issuance). Alice checks
+```
+e(T, g2) == e(h_tag, Y_bn254)                                 (hint consistency)
+e(g_alpha, g2_beta) · e(h_tag, c2) · e(T, c1)^{-1} == e(sk1, g2)   (check 2, encrypted)
+```
+since `e(h_tag, c2)·e(T, c1)^{-1} = e(h_tag, Dec)`. Plain pairings, one extra G1 point — **confirmed in code (Step 3)**;
+Groth-Sahai is not needed. Step 3 of Part A. Track in
+`thesis_log/elgamal-sk3-veck.md`.
+
+**Cross-group link (unresolved — the actual fairness gap).** The checks above prove the
+ciphertext decrypts correctly under `k`. Nothing yet proves that `Y_chain = x·G_chain` hides an
+`x` that yields that `k`. A cheating Bank can publish `Y_chain` for `x` and `Y_bn254` for an
+unrelated `k'`: it gets paid on-chain when it reveals `x`, and Alice's decryption yields garbage.
+Options:
+- **`k = H(x)`** (current doc): proving the link needs a ZK proof of a hash preimage across
+  groups (a SNARK) — heavy.
+- **`k = x`**, with `x < 2^252` (fits both the secp256k1 and BN254 scalar fields): the link is a
+  standard *cross-group discrete-log equality* proof (bit-decomposition with Pedersen
+  commitments in both groups; the technique used in Monero↔Bitcoin atomic swaps, with existing
+  Rust implementations). **Chosen and confirmed in code (Step 4).**
+Step 4 of Part A.
 
 ## Full protocol (Bank ↔ Alice)
 
@@ -111,11 +140,12 @@ Modeled on the Atomic & Fair Data paper's FDE flow, Bank = server, Alice = clien
 `sk3`:
 
 1. **Bank → Alice (off-chain):** `sk1`, `sk2` in the clear, ElGamal ciphertext
-   `(c1,c2) = (g2^b, Y_bn254^b·sk3)`, and the two public commitments `Y_chain = x·G_chain`,
-   `Y_bn254 = g2^(H(x))`.
-2. **Alice verifies** the Waters equations using the identity above (with `Y_bn254`) —
-   confirms the hidden `sk3` is well-formed without decrypting it. dmk is still dormant
-   (matches ORBIT's Issuance phase).
+   `(c1,c2) = (g2^b, Y_bn254^b·sk3)`, the commitments `Y_chain = x·G_chain`, `Y_bn254 = g2^k`,
+   `Y_G1 = g^k`, the check-2 hint `T = h_tag^k`, and a cross-group proof linking `Y_chain` to
+   `Y_bn254`.
+2. **Alice verifies** consistency, check 1 and check 2 (encrypted forms above) and the
+   cross-group proof — confirms the hidden `sk3` is well-formed *and* that the `x` she pays for
+   unlocks it, without decrypting. dmk is still dormant (matches ORBIT's Issuance phase).
 3. **Alice locks payment on-chain**, using `Y_chain` as the adaptor statement in a bonding
    transaction shaped like `CLAUDE_AandFD.md`'s §B.2 Bitcoin construction — i.e. spending the
    locked funds before the timelock requires **both** an adaptor signature under `Y_chain` and
@@ -125,9 +155,9 @@ Modeled on the Atomic & Fair Data paper's FDE flow, Bank = server, Alice = clien
    its own ordinary signature on the same spending transaction — the chain only ever sees an
    ordinary-looking adaptor-signed transaction, not `(sk1,sk2,sk3)` or any BN254 material.
 5. **Alice extracts `x`** from the on-chain transaction (`Extract`, in adaptor-signature
-   terms), computes `H(x) mod r`, then `c1^{H(x)} = g2^{b·H(x)} = Y_bn254^b`, then:
+   terms), derives `k` from it, then `c1^k = g2^{b·k} = Y_bn254^b`, then:
    ```
-   sk3 = c2 / Y_bn254^b = c2 · c1^{-H(x)}
+   sk3 = c2 / Y_bn254^b = c2 · c1^{-k}
    ```
    Alice now holds a valid `(sk1, sk2, sk3)` — dmk activated.
 
@@ -136,12 +166,18 @@ Modeled on the Atomic & Fair Data paper's FDE flow, Bank = server, Alice = clien
 Once Alice holds `sk3` in the clear (post-Step 5), she can play the Bank's role for Bob using
 the identical primitive:
 
-1. Pick fresh `b'` and a fresh secret `x_Bob` (known only to Bob), publishing the same
-   two-hop pair: `Y_Bob,chain = x_Bob·G_chain` and `Y_Bob,bn254 = g2^(H(x_Bob))`.
-2. Send Bob `sk1`, `sk2`, and `(c1', c2') = (g2^{b'}, Y_Bob,bn254^{b'}·sk3)`.
-3. Bob verifies (Step 2 above), locks payment against `Y_Bob,chain` (same two-signature
-   bonding-transaction shape as Step 3 above), and once his transaction reveals `x_Bob`,
-   decrypts `sk3` the same way Alice did.
+1. Pick fresh `b'` and a fresh secret `x'` — **known only to Alice** (the seller; whoever
+   reveals the witness is the one who gets paid — if Bob knew it he could decrypt without
+   paying). Publish the same commitments: `Y'_chain = x'·G_chain`, `Y'_bn254 = g2^{k'}`,
+   `Y'_G1 = g^{k'}`, `T' = h_tag^{k'}`, plus the cross-group proof.
+2. Send Bob `sk1`, `sk2`, and `(c1', c2') = (g2^{b'}, Y'_bn254^{b'}·sk3)`.
+3. Bob verifies (Step 2 above), locks payment against `Y'_chain` (same two-signature
+   bonding-transaction shape as Step 3 above); Alice claims it, revealing `x'`; Bob extracts
+   `x'` and decrypts `sk3` the same way Alice did.
+
+Note `h_tag` here is the tag the key was issued for — this is "Option A" (Bob reuses Alice's
+key), so `T'` uses Alice's tag, not Bob's. Also unresolved: Alice still holds `sk3` after the
+sale, so this alone doesn't make the coin one-shot.
 
 This replaces the current GS-circuit-based offline re-delegation (89 AndroidKeyStore ECDH ops since the 88-bit tag change, see "GS — the re-delegation circuit" in `CLAUDE_crypto.md`) with the same atomic-fair-exchange primitive
 used for activation. It's cryptographically equivalent to today's "Option A" (Bob reuses
@@ -166,22 +202,28 @@ Ethereum-only simplification.**
 
 ### Part A — crypto-only proof of concept (no chain, no app)
 
-Standalone Rust test in `server/rustcode` proving the full two-hop-witness loop works, before
-touching any blockchain or Android code:
+Standalone Rust binaries in `server/poc_adaptor_sig/src/bin/`, one per step, before touching
+any blockchain or Android code. Every step has negative tests: a cheating Bank must be caught
+*before* Alice pays, not after decryption.
 
-1. Generate a Waters activation key `(sk1, sk2, sk3)` as `garble_waters` already does.
-2. Pick a random `x`; compute `Y_chain = x·G_secp256k1` (use `k256` or similar — this is just
-   ordinary scalar multiplication, no adaptor signature yet) and `Y_bn254 = g2^(H(x) mod r)`.
-3. Mask `sk3`: `(c1, c2) = (g2^b, Y_bn254^b · sk3)`.
-4. Verify the bilinear identity `e(sk3,g2) = e(Y_bn254,c1)^{-1}·e(c2,g2)` holds.
-5. "Reveal" `x` (simulate the on-chain step — no actual chain involved yet), recompute
-   `H(x) mod r`, decrypt `sk3' = c2 · c1^{-H(x)}`, assert `sk3' == sk3`.
-6. Assert the recovered `(sk1, sk2, sk3')` still passes both existing Waters pairing checks
-   (`e(g,sk3)==e(sk2,g2)` and the main verification equation — see "Waters activation key" in `CLAUDE_crypto.md`).
+1. **Baseline ElGamal round trip — done** (`step1_baseline_elgamal.rs`). Uses
+   `G2::generator()` and `x` directly; later steps switch to `param.g`/`param.g2` and `k`.
+2. **Check 1 without decrypting — done** (`step2_check1_encrypted.rs`). Publish `Y_G1 = g^k`, `Y_bn254 = g2^k`; verify consistency
+   and check 1 (encrypted). Negative: tampered `c2`; `Y_G1`/`Y_bn254` with different exponents.
+   Check 1 alone accepts any self-consistent `(g^{r'}, g2^{r'})` — validity needs Step 3.
+3. **Check 2 without decrypting — done** (`step3_check2_encrypted.rs`; 11 pairings, ~12 ms). Add the hint `T = h_tag^k`; verify hint consistency and
+   check 2 (encrypted). Negative: wrong `T`; hint for a different tag; key for a different tag;
+   consistent `(sk2', sk3')` with an `sk1` that doesn't match.
+4. **Cross-group link — done** (`step4_cross_group_link.rs`, `src/dleq.rs`; proof 55.4 KB, ~230 ms prove/verify). Pick `x < 2^252`, set `k = x`, `Y_chain = x·G_secp256k1` (`k256`), and
+   prove `Y_chain`/`Y_bn254` share `x` (cross-group DLEQ). Negative: `Y_chain` for a different
+   `x` must be rejected. Run this negative test *before* adding the proof too — it should pass
+   verification, documenting the gap.
+5. **Reveal and decrypt — covered by Step 4** (case 4.2: `x` handed over as a secp256k1 scalar decrypts `sk3`; the real reveal is Part B). Simulate the on-chain reveal of `x`, decrypt `sk3' = c2 · c1^{-k}`,
+   assert `sk3' == sk3`. (Re-running the Waters checks on the decrypted key adds nothing once
+   `sk3' == sk3` holds — the encrypted checks in Steps 2–3 are the real test.)
 
-This is the step with actual research risk — confirms the two-hop witness (one secret scalar,
-two unrelated group commitments) is sound before any chain-specific work starts. Zero
-blockchain/Android dependency; testable standalone.
+Part A is complete; the remaining feasibility risk is Part B. Zero blockchain/Android dependency. Per-coin secrets
+(`x`, `b`) may use `test_rng()` in the PoC but must use `thread_rng()` once ported (CLAUDE.md).
 
 ### Part B — one concrete adaptor-signature instantiation, on a real chain
 
@@ -225,5 +267,6 @@ transaction for real:
   derived deterministically from `denomination`; `x` needs an analogous per-transaction
   generation/derivation scheme, ideally still tied to `denomination` so `Y_chain` can serve the
   same role `hashlock` does today (binding a lock to a specific coin value).
-- No Rust/Solidity/on-chain implementation exists yet — Parts A/B/C above are the plan, not yet
-  started.
+- **Decided 2026-10-07: `k = x`** (`x < 2^252`), see "Cross-group link". Read `H(x)` elsewhere in this doc as `x`.
+- The 55 KB DLEQ proof doesn't fit the single-QR offline handoff used for re-delegation; Part C needs another transport or a smaller proof.
+- Part A is done (`server/poc_adaptor_sig`, Steps 1–4; Step 5 covered by Step 4); Parts B and C not started.

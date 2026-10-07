@@ -47,11 +47,19 @@ open item — don't rely on re-reading old entries later to reconstruct what's s
 
 ## elgamal-sk3-veck.md
 
-- **Whether Waters check 2 (the `h_tag` pairing) reduces to a verify-before-decrypt proof the
-  same way check 1 does.** If it doesn't, the VECK design may need Groth-Sahai-style proofs
-  rather than a one-shot pairing trick. Not yet confirmed either way in code — this is Step 2 of
-  Part A, not yet attempted. Raised 2026-08-12 ("Step 1: baseline ElGamal-in-G2 round trip on a
-  real sk3").
+- **Hiding assumption for the encrypted sk3 not yet stated.** Publishing `Y_G1 = g^k` makes
+  DDH in G2 easy for the ciphertext, so the hiding of `sk3` rests on a computational, co-CDH-style
+  assumption (compute `g2^{kb}` from `g^k, g2^k, g2^b`), not IND-CPA. Needs stating and arguing for
+  the security chapter. Raised 2026-10-07 ("Step 3: Waters check 2 verified...").
+
+## multichain-feasibility.md
+
+- **Q3 untested: on-chain enforcement.** No adaptor signature exists yet; the reveal of `x` is
+  simulated. Part B. Raised 2026-10-07.
+- **DLEQ proof size and speed for the offline handoff.** 55.4 KB and ~230 ms prove/verify on a
+  laptop; doesn't fit the single-QR re-delegation handoff, and phone timing is unmeasured.
+  Options: multi-QR/NFC/Bluetooth transport, or a more compact proof. Raised 2026-10-07
+  ("Step 4: cross-group DLEQ...").
 
 ## Tracked elsewhere (cross-reference only, not originated in thesis_log)
 
