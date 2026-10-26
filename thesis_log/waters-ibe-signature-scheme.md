@@ -655,3 +655,52 @@ evaluator still chooses every tag bit, including the denomination bits (the deno
 forgery fix is still only proposed); activation still does not need the bank; the hashlock is
 still shared per denomination. Next steps: build and test the app on a device, including that
 94 uses suffice in practice, then redeploy the contract.
+
+## 2026-10-26 — Master secret `beta_secret` derivable from the public parameter seed
+
+**Attempt:** While reviewing the proposed denomination-forgery fix (one GS slot per fixed
+`DDD` bit instead of two), the generation of the Waters master secret was checked to see whether
+it could undermine any circuit-level fix.
+**Result:** Failure (security flaw found by code reading; not yet confirmed by an experiment).
+`beta_secret` can be recomputed by anyone, and the app's bundled parameter file contains it.
+**Details:** `generate_params_waters()` (`server/rustcode/src/lib.rs:150`) draws its values in
+this order:
+```rust
+let mut rng = ark_std::test_rng();            // fixed seed, public in the arkworks source
+let alpha_secret = ScalarField::rand(&mut rng);
+let beta_secret = alpha_secret;
+let g = G::rand(&mut rng);  let g_alpha = g * alpha_secret;
+let g2 = G2::rand(&mut rng); let g2_beta = g2 * beta_secret;
+```
+`ark_std::test_rng()` always starts from the same hard-coded seed. Running the same three lines
+outside the server therefore gives `beta_secret` and the master key `msk = g_alpha^beta`.
+With `msk`, a valid Waters key for any tag is `sk1 = msk · h_tag^r`, `sk2 = g^r`,
+`sk3 = g2^r` for any `r`. That means any denomination and any user, without a coin, a GS
+circuit or attested hardware.
+
+Separately, the parameter file the app bundles
+(`paymentbox_otp/app/src/main/res/raw/waters_params.json`) contains a non-zero
+`beta_secret` field next to `g`, `g_alpha`, `g2`, `g2_beta`, `h_vec` and `h_0`. That file was
+inspected directly. So the secret is also present in every APK, independently of the seed.
+
+An empirical check was planned but not run: recompute `beta_secret` with
+`poc_adaptor_sig::generate_params(&mut ark_std::test_rng())`, compare it byte-for-byte with
+the bundled file, and verify `e(msk, g2) = e(g_alpha, g2_beta)`. The PoC copy draws values in
+the same order as the server function, so a match is expected.
+**Why:** The 2026-10-05 fix moved per-coin secrets (`r`, masks, AoN shares) to
+`rand::thread_rng()`. It deliberately kept the fixed seed for the Waters parameters, so the app
+could bundle them instead of receiving them. That reasoning holds for the *public* parameters,
+but the same seeded generator also produces the *secret* `alpha_secret`/`beta_secret`. The rule
+"`beta_secret` never leaves the server" (CLAUDE.md) cannot hold when the secret is not random:
+it never needs to leave, because anyone can recompute it.
+**Implication:** This breaks unforgeability of every Waters key, and with it any
+denomination-forgery fix at the GS-circuit level. It must be fixed first.
+- **Proposed fix:** generate `beta_secret` once with real randomness (`thread_rng()` or an
+  offline ceremony) and store it only on the server. The public elements `g`, `g2`, `h_0` and
+  `h_vec` may still come from the fixed seed. Compute `g_alpha`/`g2_beta` with the secret and
+  bundle them as public constants. Remove `beta_secret` from `waters_params.json`.
+- **Note on `alpha = beta`:** `alpha_secret = beta_secret` reduces the scheme to a single
+  secret. Whether that matters once the secret is random needs a check against the Waters key
+  structure (`CLAUDE_Waters.md`).
+- **Every key and coin issued so far** under the current parameters must be treated as
+  forgeable, and the bundled parameters regenerated.
