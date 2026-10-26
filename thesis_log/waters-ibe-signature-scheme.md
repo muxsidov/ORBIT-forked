@@ -704,3 +704,74 @@ denomination-forgery fix at the GS-circuit level. It must be fixed first.
   structure (`CLAUDE_Waters.md`).
 - **Every key and coin issued so far** under the current parameters must be treated as
   forgeable, and the bundled parameters regenerated.
+
+## 2026-10-26 — Denomination forgery, Part 1: single-slot fixed bits in the GS circuit
+
+**Attempt:** Closed the circuit-level hole in the denomination-forgery item. `generate_gs_core`
+garbled both slots of all 88 tag bits, so the evaluator (Alice) could pick any `DDD`. The
+function now takes the coin's denomination and, for the fixed bytes 3–7 (`_DDD_` in
+`UUU_DDD_CCC`, bits 24–63), garbles only the slot matching the real bit. The other slot is `""`
+in `key_mat{0,1}[i]` and `slots_c{0,1}[i]`, so indices and JSON shape are unchanged.
+**Result:** Success on the server. `test_gs_full` (extended) and `test_redelegate_full` pass; 9
+cases in `test-results.md`, run 2026-10-26 (2). The Android copy of `evaluate_gs` was changed
+identically but not built.
+**Details:** Files: `server/rustcode/src/lib.rs` (`generate_gs_core`, `garble_waters_with_gs`
+gains a `denomination` argument), `server/rustcode/src/pbcrypto.rs` and the Android
+`pbcrypto.rs` (`evaluate_gs` returns an error naming the fixed bit when the requested slot is
+empty), `server/server.py` (denomination threaded through `_garble_with_gs`,
+`_garble_one_circuit`, `/api/delegatedpresig`, `/api/replenish`). Shared-key count (1 + 2·88)
+and `_GS_NUSECOUNT = 94` are unchanged; Alice still opens one slot per bit, so 40 of the 94 uses
+are spent on bits that have no choice. A denomination-1 coin evaluated at a denomination-100 tag
+fails with `tag bit 32 (byte 4) is fixed by the coin to 0: no slot for 1`. Re-delegation to
+another UUU and CCC at the same denomination still verifies.
+**Why:** Forging a fixed bit from 0 to 1 needs the slot `u_i·r + s_i`, which means computing
+`h_i·r` from `g^r` (CDH in G1). Forging 1 to 0 needs the mask `s_i` alone, which is never
+published. Only the slot for the real bit exists in the circuit, so neither is available.
+This replaces the previously proposed design (fold the fixed bits into `base_dk1`); it is
+simpler because the evaluator's loop keeps its shape, at the price of the 40 unneeded uses.
+**Implication:** The fix has no effect at payout until the tag-encoding mismatch is fixed:
+client keys never pass `hashlockMatches` and `/api/pay` substitutes a server-derived key. Not
+fixed here. It also rests on `beta_secret` being secret, and the entry of the same date shows it
+is derivable from the fixed seed; that is a separate issue and untouched. The Android
+`librust.so` must be rebuilt and old coins re-minted (they carry both slots for every bit).
+Dropping the 40 unneeded uses (`_GS_NUSECOUNT = 54`) is possible later.
+
+## 2026-10-26 — Denomination forgery, Part 2: `/api/redelegate` and `/api/pay` read the denomination from the contract
+
+**Attempt:** Removed the server-level hole. `/api/redelegate` read `denomination` from the
+request, skipped the old withdrawal when `contract_id` was empty, only logged a failed
+withdrawal, and then always called `newContract()`, so `{"denomination": 100}` minted a 1 ETH
+HTLC from nothing.
+**Result:** Success, tested against mocks only; 15 assertions in `test-results.md`, run
+2026-10-26 (3).
+**Details:** New `_contract_denomination()` in `server/server.py`: rejects a missing, empty,
+malformed or non-32-byte `contract_id` (400); reads `getContract()` from `zfairexchange.sol`;
+rejects unknown, withdrawn or refunded contracts (400); maps the on-chain `hashlock` back to a
+denomination via `denomination_config()`; rejects a request denomination that disagrees (400).
+`/api/redelegate` now returns 500 and creates nothing when the old withdrawal raises or is
+mined with status 0. `/api/pay` uses the same rule. `0x` is stripped with `removeprefix`.
+**Why:** `hashlock = denomination` for every contract, so the contract itself is the trusted
+source of the denomination. The old code let the client choose both the amount to lock and
+whether a coin existed at all.
+**Implication:** The live hole is closed for any server that uses this code. `/api/lock` still
+takes the denomination from the request; that is intended (it locks the bank's own funds for a
+dormant coin, with the user paying nothing on-chain in this demo), but it is the same trust
+pattern and worth a note if the purchase flow is built. Real-chain behaviour is untested, and
+the deployed contract is still the old one.
+
+## 2026-10-26 — Provenance of the denomination-forgery fixes: branch and session
+
+**Attempt:** Recorded where the two denomination-forgery changes of this date live, so the
+entries above can be traced to code and to the working session.
+**Result:** Success.
+**Details:** Git branch `fix/denomination-forgery` (base `a6b8971`, working tree uncommitted at
+the time of writing; the two parts are to be committed separately on request). Claude Code
+session name: `send-either-one-or-zero` (Part 1: send either the 0 or the 1 slot for fixed tag
+bits; Part 2: server-side denomination trust). Related entries: "Denomination forgery, Part 1"
+and "Denomination forgery, Part 2" (2026-10-26); test runs 2026-10-26 (2) and (3) in
+`test-results.md`.
+**Why:** Entries in this log are history; the branch and session name are the only stable
+handles to the exact code state and the reasoning that produced it.
+**Implication:** After the commits are made, the commit hashes should be added in a follow-up
+entry, since this one cannot name them yet. The Android `evaluate_gs` change is committed from
+the separate Windows repository and is not covered by this branch.

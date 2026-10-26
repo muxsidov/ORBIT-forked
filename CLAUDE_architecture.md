@@ -109,8 +109,9 @@ The server is contacted only at Alice's mint and Bob's withdrawal.
 
 POST `/api/redelegate {contract_id, denomination}` → server withdraws Alice's HTLC with its own
 key, then creates a fresh HTLC for Bob → QR with the stored `(sk1, sk2, sk3)` and Bob's new
-`contract_id`. Known hole: it trusts the request's denomination and still mints the new HTLC
-when `contract_id` is empty or the old withdrawal fails.
+`contract_id`. The denomination comes from Alice's on-chain contract (a mismatching
+request denomination → 400); an empty `contract_id` → 400; if the old withdrawal fails, no new
+HTLC is created.
 
 ### Option A vs. Option B
 

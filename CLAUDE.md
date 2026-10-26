@@ -115,9 +115,11 @@ Full list and status in `thesis_log/open-questions.md`; details in the topic fil
 - **Critical — contract not redeployed:** the `memory` → `storage` fix in `zfairexchange.sol` is
   in source (tested locally, `server/test_htlc_state.py`), but `HTLC_ADDRESS` still points to the
   old contract, where withdrawals repeat and drain the pool (`CLAUDE_contracts.md`).
-- **Denomination forgery** (supervisor's concern): the GS circuit leaves `DDD` bits choosable,
-  and `/api/pay` / `/api/redelegate` trust the client's denomination. Fix proposed, not
-  implemented.
+- **Denomination forgery** (supervisor's concern): fixed in code on `fix/denomination-forgery`, not
+  yet enforced end to end. The GS circuit garbles one slot for the fixed `_DDD_` bits, and
+  `/api/pay` / `/api/redelegate` take the denomination from the on-chain contract. It only bites
+  at payout once the tag-encoding mismatch is fixed; the Android `librust.so` needs a rebuild and
+  old coins a re-mint (`CLAUDE_crypto.md`).
 - **Tag-encoding mismatch:** client keys never pass the on-chain check; `/api/pay` substitutes a
   server-derived key and ignores the submitted one.
 - Also: activation doesn't need the bank; hashlock shared per denomination; software attestation

@@ -389,9 +389,13 @@ fn garble_waters_with_gs(
     tag: String,
     gs_shared_key_list: &'_ Bound<'_, PyList>,
     tag_bits: usize,
+    denomination: u32,
 ) -> PyResult<(String, String)> {
+    if denomination > 999 {
+        return Err(PyOSError::new_err(format!("denomination {denomination} does not fit the 3-digit DDD field")));
+    }
     let (paybox_json, link) = garble_waters_core(&param, pylist_to_bytes(shared_key_list), garble_message_size, MAX_ITEM, tag);
-    let gs_json = generate_gs_core(&param, pylist_to_bytes(gs_shared_key_list), tag_bits, &link);
+    let gs_json = generate_gs_core(&param, pylist_to_bytes(gs_shared_key_list), tag_bits, denomination, &link);
     Ok((paybox_json, gs_json))
 }
 
@@ -564,6 +568,14 @@ fn garble_waters_core(param: &str, shared_key_byte: Vec<Vec<u8>>, garble_message
 //     link, the branch and one slot per bit were all opened. With nusecount = 5 (GWat) + 1 + l,
 //     opening both slots of any bit leaves some other bit unopened, so no key can be derived.
 //
+// Fixed tag bits: the tag is "UUU_DDD_CCC" (11 ASCII bytes, bit i = byte i/8, bit i%8 LSB-first
+// ↦ h_vec[i]). Bytes 3..8 ("_DDD_") are fixed by the coin and get only the slot matching the coin's
+// real bit; the other slot is "" so indices and shapes stay the same. UUU and CCC keep both slots
+// because Alice picks the recipient's tag offline.
+//   Why it's secure: forging a fixed bit 0→1 needs the slot u_i·r + s_i, i.e. h_i·r from g^r
+//   (CDH); forging 1→0 needs the mask s_i alone, which is never given out. The garbled key
+//   material for the missing slot doesn't exist, so the evaluator cannot even open it.
+//
 // Output JSON (Alice's device adds the epk separately):
 //   {base_key_mat, base_enc, key_mat0[i], key_mat1[i], slots_c0[i], slots_c1[i]}  (hex)
 //
@@ -572,11 +584,18 @@ fn garble_waters_core(param: &str, shared_key_byte: Vec<Vec<u8>>, garble_message
 //   dk1 = Dec_a(base_enc).dk1 + Σ_i Dec_{H(a||b_i)}(slots_c{btag_i}[i])   (G1 addition)
 //   dk2, dk3 = from Dec_a(base_enc)
 const GS_CHECK_LEN: usize = 16;
+const GS_FIXED_BYTES: std::ops::Range<usize> = 3..8; // "_DDD_" in "UUU_DDD_CCC"
 
-fn generate_gs_core(param_str: &str, shared_keys: Vec<Vec<u8>>, tag_bits: usize, link: &[u8; 32]) -> String {
+fn generate_gs_core(param_str: &str, shared_keys: Vec<Vec<u8>>, tag_bits: usize, denomination: u32, link: &[u8; 32]) -> String {
     let param: ParamWaters = serde_json::from_str(param_str).unwrap();
     let mut rng = rand::thread_rng();
     assert_eq!(shared_keys.len(), 1 + tag_bits * 2, "GS shared_keys count mismatch");
+    assert_eq!(tag_bits, 88, "GS tag layout \"UUU_DDD_CCC\" needs 88 bits");
+    let fixed_bytes = format!("_{:03}_", denomination).into_bytes();
+    // Some(real bit) for a fixed position, None for a free (UUU / CCC) one.
+    let fixed_bit = |i: usize| -> Option<usize> {
+        GS_FIXED_BYTES.contains(&(i / 8)).then(|| ((fixed_bytes[i / 8 - GS_FIXED_BYTES.start] >> (i % 8)) & 1) as usize)
+    };
 
     let rand_r = ScalarField::rand(&mut rng);
     let msk = param.g_alpha * param.beta_secret;
@@ -613,6 +632,11 @@ fn generate_gs_core(param_str: &str, shared_keys: Vec<Vec<u8>>, tag_bits: usize,
         let a_i = &aon_shares[1 + i];
         let bit1_share = param.h_vec[i] * rand_r + shares[i];
         for (bit, share) in [shares[i], bit1_share].iter().enumerate() {
+            if fixed_bit(i).is_some_and(|real| real != bit) {
+                key_mat[bit].push(String::new());
+                slots[bit].push(String::new());
+                continue;
+            }
             let mut b_ib = [0u8; 32];
             rng.fill(&mut b_ib);
             let k_ib = &shared_keys[1 + 2 * i + bit];

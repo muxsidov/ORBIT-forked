@@ -84,8 +84,8 @@ use, and the budget has none to spare (below). Opening GS without GWat fails (no
 `test_gs_full()` checks the honest flow (94 uses, key verifies for exactly one tag), rejection of
 another coin's GWat key, failure with any bit slot unopened, and fresh randomness per coin.
 
-What it does **not** fix: the evaluator still chooses every tag bit, including `DDD`
-(denomination forgery, below). The old "keys from one circuit are linkable" issue is moot now
+What it does **not** fix: the evaluator still chooses UUU and CCC freely (by design); `DDD` is
+fixed by the coin (denomination forgery, below). The old "keys from one circuit are linkable" issue is moot now
 that a circuit yields only one key.
 
 ### Budget (`nusecount`)
@@ -113,25 +113,24 @@ tag; the ~7M-value tag space is brute-forceable from a submitted key (linkabilit
 minted before the 56→88-bit change or the masking change are incompatible (re-mint);
 `CCC ≥ 1000` breaks the format.
 
-## Known flaw — denomination forgery (OPEN, raised by supervisor)
+## Denomination forgery (fixed in code; enforced at payout only after the encoding fix)
 
-1. **Circuit level.** `generate_gs_core` gives a free 1-of-2 choice on every tag bit, including the
-   fixed denomination bits `DDD` (bytes 4–6) and the separators. Latent today only because of the
-   tag-encoding mismatch below.
-2. **Server level (live).** `/api/pay` and `/api/redelegate` read `denomination` from the request
-   body. `/api/redelegate` with an empty `contract_id` (or a failing old withdrawal) still mints a
-   fresh HTLC for that denomination: `{contract_id: "", denomination: 100}` creates an unbacked
-   100C coin.
+1. **Circuit level (fixed).** `generate_gs_core(…, denomination, …)` garbles, for the fixed bytes 3–7
+   (`_DDD_`, bits 24–63), only the slot matching the coin's real bit; the other `key_mat` /
+   `slots_c` entry is `""`. `evaluate_gs` (server and Android copies) returns an error naming the
+   bit when it hits an empty slot. UUU (bytes 0–2) and CCC (bytes 8–10) keep both slots. Forging a
+   fixed bit 0→1 needs `h_i·r` from `g^r` (CDH); 1→0 needs the mask `s_i`, never published. The
+   budget stays 94 (Alice opens one slot per bit, including the 40 fixed ones); `54` would be
+   possible. Android needs a `librust.so` rebuild; coins minted earlier have both slots and must
+   be re-minted.
+2. **Server level (fixed).** `_contract_denomination()` reads the denomination from `getContract()`
+   (hashlock → denomination), rejects an empty/unknown/spent `contract_id` and a mismatching
+   request denomination (400). `/api/redelegate` aborts without creating a new HTLC if the old
+   withdrawal fails; `/api/pay` uses the same rule. `/api/lock` still trusts the request.
 
-**Planned fix (proposed, not implemented):**
-- *Circuit:* fold the fixed bits into the base at mint time,
-  `base_dk1 = msk + (u′ + Σ_{fixed bits = 1} u_j)·r`, and emit slots only for `UUU` and `CCC`;
-  `evaluate_gs`/`computeGsAk2` must skip fixed positions. Forging a denomination then needs
-  `u_j^r` from `u_j` and `g^r` — CDH. 48 free bits → `nusecount = 5 + 1 + 48 = 54` (exact). Paper's alternative: one Waters key per
-  denomination.
-- *Server:* read the denomination from the on-chain contract; reject an empty `contract_id` and
-  abort on a failed withdrawal in `/api/redelegate` (or remove that endpoint).
-- Verifying the circuit fix on-chain requires the tag-encoding fix below.
+Both rest on `beta_secret` being secret, which it is not yet (derivable from the fixed seed, see
+`thesis_log/waters-ibe-signature-scheme.md`, 2026-10-26). Verifying the circuit fix on-chain
+requires the tag-encoding fix below.
 
 ## Tag-encoding mismatch (OPEN)
 

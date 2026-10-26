@@ -433,6 +433,9 @@ pub fn evaluate_gs(gs_circuit_json: &str, bob_tag: &str, shared_keys: &[u8], gwa
     let mut b_vals: Vec<Vec<u8>> = Vec::with_capacity(num_bits);
     for i in 0..num_bits {
         let key_mat = if bit_of(i) == 0 { &gs.key_mat0[i] } else { &gs.key_mat1[i] };
+        if key_mat.is_empty() {
+            return Err(format!("tag bit {} (byte {}) is fixed by the coin to {}: no slot for {} (denomination mismatch?)", i, i / 8, 1 - bit_of(i), bit_of(i)));
+        }
         let a_b = decrypt(&unhex(key_mat)?, key_at(1 + i), 0);
         for j in 0..32 { aon_key[j] ^= a_b[j]; }
         b_vals.push(a_b[32..64].to_vec());

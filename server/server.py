@@ -162,9 +162,11 @@ _GS_TAG_BITS = 88  # 11 bytes × 8 bits for "UUU_DDD_CCC" tag format (uid + deno
 _GS_NUSECOUNT = 94
 
 
-def _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag):
+def _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag, denomination):
     """Garble GWat (from shared_key_arr) plus its linked GS circuit for raw_pk.
 
+    The coin's denomination is baked into the GS circuit: only the matching slot of each fixed
+    "_DDD_" tag bit is garbled, so a re-delegator cannot evaluate it at another denomination.
     Returns (garble_msg, gs_circuit_dict) where gs_circuit_dict includes its "epk".
     """
     gs_epk = b""
@@ -175,13 +177,13 @@ def _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_it
         gs_shared_keys.append(priv.exchange(ec.ECDH(), raw_pk))
     garble_msg, gs_str = garble_waters_with_gs(
         water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag,
-        gs_shared_keys, _GS_TAG_BITS,
+        gs_shared_keys, _GS_TAG_BITS, denomination,
     )
     gs_json = json.loads(gs_str)
     gs_json["epk"] = urlsafe_b64encode(gs_epk).decode("ascii")
     return garble_msg, gs_json
 
-def getpresig_fn(att_json, tag="001_000"):
+def getpresig_fn(att_json, tag="001_000", denomination=1):
     # att_json = json.loads((request.args.get('attestation')))
     is_valid_att, targetpk, nusecount = verify_attestation(att_json)
     assert nusecount==40 or nusecount==5 or nusecount==10 or nusecount==_GS_NUSECOUNT, "Currently only support nUSE Count = 40/5/10/" + str(_GS_NUSECOUNT) + ", received:" +  str(nusecount)
@@ -209,14 +211,14 @@ def getpresig_fn(att_json, tag="001_000"):
 
     gs_circuit = None
     if nusecount == _GS_NUSECOUNT:
-        garble_msg, gs_circuit = _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag)
+        garble_msg, gs_circuit = _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag, denomination)
     else:
         garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag)
 
     return garble_msg, epk, gs_circuit
 
 
-def _garble_one_circuit(raw_pk, tag):
+def _garble_one_circuit(raw_pk, tag, denomination):
     """Garble one Waters circuit (GWat + GS) for a single AndroidKeyStore pubkey and tag.
 
     Always generates the GS circuit (1 + 2 × _GS_TAG_BITS slots) alongside GWat (5 positions × 256 items),
@@ -233,7 +235,7 @@ def _garble_one_circuit(raw_pk, tag):
             priv = ec.generate_private_key(ec.SECP256R1())
             epk += priv.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
             shared_key_arr.append(priv.exchange(ec.ECDH(), raw_pk))
-    garble_msg, gs_json = _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag)
+    garble_msg, gs_json = _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, tag, denomination)
 
     return epk, garble_msg, gs_json
 
@@ -270,7 +272,7 @@ def getpresig():
 
     gs_circuit = None
     if nusecount == _GS_NUSECOUNT:
-        garble_msg, gs_circuit = _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, cfg["tag"])
+        garble_msg, gs_circuit = _garble_with_gs(raw_pk, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, cfg["tag"], denomination)
     else:
         garble_msg = garble_waters(water_parameter, shared_key_arr, num_selectable_elem, num_possible_item_per_elem, cfg["tag"])
 
@@ -386,32 +388,73 @@ def waters_solidity_params():
     result = water_unlock_solidity(water_parameter, id)
     return jsonify(json.loads(result))
 
+class _BadRequest(Exception):
+    """Client error in a contract-spending endpoint; mapped to HTTP 400."""
+
+def _contract_denomination(body):
+    """Resolve (contract_id_hex, contract_id_bytes, denomination) for a spend request.
+
+    The denomination comes from the on-chain contract (its hashlock is fixed per denomination),
+    never from the request. A denomination in the body is only accepted if it agrees.
+    Raises _BadRequest for a missing/malformed/unknown contract or a mismatching denomination.
+    """
+    contract_id_hex = (body.get('contract_id') or '').strip()
+    if not contract_id_hex:
+        raise _BadRequest('contract_id missing — was this card created with blockchain enabled?')
+    try:
+        contract_id_bytes = bytes.fromhex(contract_id_hex.removeprefix('0x'))
+    except ValueError:
+        raise _BadRequest('contract_id is not valid hex')
+    if len(contract_id_bytes) != 32:
+        raise _BadRequest('contract_id must be 32 bytes')
+
+    _init_web3()
+    _ensure_setup()
+    try:
+        *_, hashlock, _timelock, withdrawn, refunded, _preimage = _htlc.functions.getContract(contract_id_bytes).call()
+    except Exception as e:
+        raise _BadRequest(f'unknown contract {contract_id_hex}: {e}')
+    if withdrawn or refunded:
+        raise _BadRequest('contract already withdrawn or refunded')
+    by_hashlock = {denomination_config(d)['hashlock']: d for d in _DENOM_ETH}
+    if hashlock not in by_hashlock:
+        raise _BadRequest(f'contract has unsupported hashlock {hashlock}')
+    denomination = by_hashlock[hashlock]
+
+    claimed = body.get('denomination')
+    try:
+        mismatch = claimed is not None and int(claimed) != denomination
+    except (TypeError, ValueError):
+        mismatch = True
+    if mismatch:
+        raise _BadRequest(f'denomination {claimed} does not match the contract ({denomination})')
+    return contract_id_hex, contract_id_bytes, denomination
+
 @app.route('/api/redelegate', methods=['POST'])
 def redelegate():
     """Withdraw Alice's HTLC and create a fresh HTLC for Bob at the same denomination.
 
-    Body: {contract_id, denomination}
+    Body: {contract_id, denomination?}
     Returns: {contract_id} — Bob's new HTLC id.
     Alice has already computed ak2 offline via GS evaluation; the server only handles HTLCs.
+    The denomination is taken from Alice's on-chain contract; a request denomination that
+    differs is rejected. Bob's HTLC is only created after Alice's withdrawal is confirmed.
     """
     try:
-        _init_web3()
-        _ensure_setup()
-
-        denomination = int(request.json.get('denomination', 1))
+        body = request.get_json(silent=True) or {}
+        alice_contract_id_hex, alice_contract_id_bytes, denomination = _contract_denomination(body)
         cfg = denomination_config(denomination)
 
         # Withdraw Alice's HTLC using server-derived key (beta_secret on server)
-        alice_contract_id_hex = request.json.get('contract_id', '')
-        if alice_contract_id_hex:
-            try:
-                sol = json.loads(water_unlock_solidity(water_parameter, denomination))
-                alice_contract_id_bytes = bytes.fromhex(alice_contract_id_hex.removeprefix('0x'))
-                preimage = (_g1(sol['sk1']), _g1(sol['sk2']), _g2(sol['sk3']))
-                _send_tx(_htlc.functions.withdraw(alice_contract_id_bytes, preimage))
-                print(f"[REDELEGATE] withdrew Alice's HTLC {alice_contract_id_hex[:10]}...")
-            except Exception as e:
-                print(f"[WARN] Could not withdraw Alice's HTLC: {e}")
+        try:
+            sol = json.loads(water_unlock_solidity(water_parameter, denomination))
+            preimage = (_g1(sol['sk1']), _g1(sol['sk2']), _g2(sol['sk3']))
+            receipt_old = _send_tx(_htlc.functions.withdraw(alice_contract_id_bytes, preimage))
+        except Exception as e:
+            return jsonify({'error': f"withdrawing Alice's HTLC failed: {e}"}), 500
+        if receipt_old['status'] != 1:
+            return jsonify({'error': "withdrawing Alice's HTLC failed on-chain"}), 500
+        print(f"[REDELEGATE] withdrew Alice's HTLC {alice_contract_id_hex[:10]}...")
 
         # Create Bob's HTLC at same denomination
         timelock = int(time.time()) + 3600
@@ -426,6 +469,8 @@ def redelegate():
         contract_id_hex = logs[0]['args']['contractId'].hex()
         print(f"[REDELEGATE] Bob's HTLC created denomination={denomination} contract_id={contract_id_hex}")
         return jsonify({'contract_id': contract_id_hex})
+    except _BadRequest as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -473,7 +518,7 @@ def replenish():
         count = int(req['count'])
         cfg = denomination_config(denomination)
         for _ in range(count):
-            epk, garble_msg, gs_circuit = _garble_one_circuit(raw_pks[len(circuits)], cfg['tag'])
+            epk, garble_msg, gs_circuit = _garble_one_circuit(raw_pks[len(circuits)], cfg['tag'], denomination)
             circuits.append({
                 'denomination': denomination,
                 'contract_id': "",
@@ -522,17 +567,9 @@ def _user_id_from_tag(tag: str) -> int:
 @app.route('/api/pay', methods=['POST'])
 def pay():
     try:
-        _init_web3()
-        _ensure_setup()
-
-        contract_id_hex = request.json.get('contract_id', '')
-        if not contract_id_hex:
-            return jsonify({'error': 'contract_id missing — was this card created with blockchain enabled?'}), 400
-
-        denomination = int(request.json.get('denomination', 1))
+        contract_id_hex, contract_id_bytes, denomination = _contract_denomination(request.get_json(silent=True) or {})
         print(f"[PAY] withdraw requested for contract_id={contract_id_hex}, denomination={denomination}")
         sol = json.loads(water_unlock_solidity(water_parameter, denomination))
-        contract_id_bytes = bytes.fromhex(contract_id_hex.removeprefix('0x'))
 
         preimage = (_g1(sol['sk1']), _g1(sol['sk2']), _g2(sol['sk3']))
         receipt_withdraw = _send_tx(_htlc.functions.withdraw(contract_id_bytes, preimage))
@@ -543,6 +580,8 @@ def pay():
             'tx_hash':     receipt_withdraw['transactionHash'].hex(),
             'contract_id': contract_id_hex,
         })
+    except _BadRequest as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1119,8 +1158,8 @@ def test_gs_full():
             keys.append(override[i] if override and i in override else ecdh(gs_epk, 1 + 2 * i + b))
         return keys
 
-    def mint():
-        epk, garble_msg, gs = _garble_one_circuit(device.public_key(), make_tag(1, 0))
+    def mint(denomination=1):
+        epk, garble_msg, gs = _garble_one_circuit(device.public_key(), make_tag(1, 0), denomination)
         return epk, garble_msg, gs, urlsafe_b64decode(gs["epk"])
 
     # --- Honest flow: activate (GWat, 5 uses) then re-delegate once (GS, 1 + 88 uses) ---
@@ -1135,6 +1174,49 @@ def test_gs_full():
     assert not test_verify_gs_key(water_parameter, "002_001_001", *ak2), "key must not verify for another tag"
     assert uses[0] == _GS_NUSECOUNT, f"honest flow used {uses[0]} ECDH ops, budget is {_GS_NUSECOUNT}"
     print(f"[ok] honest activate + re-delegate: key verifies for {bob_tag}, {uses[0]} ECDH uses")
+
+    # --- Fixed bits: denomination and separators have one slot only ---
+    n_fixed = sum(1 for i in range(_GS_TAG_BITS) if gs["key_mat0"][i] == "" or gs["key_mat1"][i] == "")
+    assert n_fixed == 40, f"expected 40 single-slot bits ('_DDD_'), got {n_fixed}"
+    assert all(gs["key_mat0"][i] and gs["key_mat1"][i] for i in list(range(24)) + list(range(64, 88))), "UUU/CCC bits must keep both slots"
+    assert all((gs["key_mat0"][i] == "") == (gs["slots_c0"][i] == "") and (gs["key_mat1"][i] == "") == (gs["slots_c1"][i] == "") for i in range(_GS_TAG_BITS))
+    print(f"[ok] {n_fixed} fixed bits are single-slot, UUU/CCC bits keep both")
+
+    # --- Re-delegation to a different UUU and CCC at the same denomination still works ---
+    # (uses a fresh coin: each coin's device key has exactly one evaluation's worth of budget)
+    epk_d, garble_msg_d, gs_d, gs_epk_d = mint(1)
+    pattern_d = [secrets.randbelow(256) for _ in range(5)]
+    _, sk2_d, sk3_d = test_rdelegate_local(water_parameter, garble_msg_d, [ecdh(epk_d, i * 256 + v) for i, v in enumerate(pattern_d)], pattern_d, 5, 256)
+    other_tag = "017_001_123"
+    ak_d = gs_eval(gs_d, other_tag, gs_keys(gs_epk_d, other_tag), sk2_d, sk3_d)
+    assert test_verify_gs_key(water_parameter, other_tag, *ak_d), "key for another UUU/CCC must verify"
+    print(f"[ok] re-delegation to {other_tag} (other UUU and CCC, same denomination) verifies")
+
+    # --- Denomination forgery: a denomination-1 coin cannot be evaluated at a denomination-100 tag ---
+    epk_f, garble_msg_f, gs_f, gs_epk_f = mint(1)
+    pattern_f = [secrets.randbelow(256) for _ in range(5)]
+    _, sk2_f, sk3_f = test_rdelegate_local(water_parameter, garble_msg_f, [ecdh(epk_f, i * 256 + v) for i, v in enumerate(pattern_f)], pattern_f, 5, 256)
+    forged_tag = "002_100_000"
+    try:
+        # Alice's device would happily do the ECDH for the forged tag; the circuit has no slot.
+        ak_f = gs_eval(gs_f, forged_tag, gs_keys(gs_epk_f, forged_tag), sk2_f, sk3_f)
+        assert not test_verify_gs_key(water_parameter, forged_tag, *ak_f), "forged denomination produced a valid key"
+    except OSError as e:
+        assert "fixed by the coin" in str(e), e
+        print(f"[ok] denomination-1 coin at denomination-100 tag rejected: {e}")
+
+    # --- A coin minted at denomination 100 does evaluate at a denomination-100 tag, not at 1 ---
+    epk_h, garble_msg_h, gs_h, gs_epk_h = mint(100)
+    pattern_h = [secrets.randbelow(256) for _ in range(5)]
+    _, sk2_h, sk3_h = test_rdelegate_local(water_parameter, garble_msg_h, [ecdh(epk_h, i * 256 + v) for i, v in enumerate(pattern_h)], pattern_h, 5, 256)
+    ak_h = gs_eval(gs_h, "002_100_000", gs_keys(gs_epk_h, "002_100_000"), sk2_h, sk3_h)
+    assert test_verify_gs_key(water_parameter, "002_100_000", *ak_h)
+    try:
+        gs_eval(gs_h, "002_001_000", gs_keys(gs_epk_h, "002_001_000"), sk2_h, sk3_h)
+        raise AssertionError("denomination-100 coin evaluated at a denomination-1 tag")
+    except OSError:
+        pass
+    print("[ok] denomination-100 coin evaluates at its own denomination only")
 
     # --- GS without this coin's GWat key (skipping activation to save 5 uses) fails ---
     _, garble_msg_b, gs_b, gs_epk_b = mint()
@@ -1166,6 +1248,110 @@ def test_gs_full():
     assert json.loads(garble_msg)["sig2"] != json.loads(garble_msg_b)["sig2"]
     print("[ok] two coins get independent GS masks and GWat r")
     print("GS full test PASSED")
+
+
+def test_denomination_trust():
+    """/api/redelegate and /api/pay take the denomination from the on-chain contract.
+
+    Flask test client with web3 and _htlc mocked (no chain, no env vars needed).
+    Run: python3 -c "from server import test_denomination_trust; test_denomination_trust()"
+    """
+    from unittest import mock
+
+    cid = bytes(range(32))
+    state = {'hashlock': 1, 'withdrawn': False, 'withdraw_status': 1, 'raise_on_withdraw': False}
+    sent = []  # ('withdraw' | 'newContract', args)
+
+    htlc = mock.MagicMock()
+    htlc.functions.getContract.side_effect = lambda c: mock.MagicMock(call=lambda: (
+        'sender', 'receiver', 1, state['hashlock'], 0, state['withdrawn'], False, None))
+    htlc.functions.withdraw.side_effect = lambda c, pre: ('withdraw', c)
+    htlc.functions.newContract.side_effect = lambda r, h, t: ('newContract', h)
+    new_id = bytes([0xAB]) * 32
+    htlc.events.HTLCETHNew.return_value.process_receipt.return_value = [{'args': {'contractId': new_id}}]
+    w3 = mock.MagicMock()
+    w3.to_wei.side_effect = lambda v, unit: int(v * 10**18)
+
+    def fake_send_tx(fn, value=0):
+        sent.append((fn, value))
+        if fn[0] == 'withdraw' and state['raise_on_withdraw']:
+            raise RuntimeError('execution reverted')
+        return {'status': state['withdraw_status'] if fn[0] == 'withdraw' else 1, 'transactionHash': b'\x01' * 32}
+
+    sol_stub = json.dumps({k: {'x': '1', 'y': '2'} for k in ('sk1', 'sk2')} | {'sk3': {'x': ['1', '2'], 'y': ['3', '4']}})
+    cases = []
+    def check(name, ok):
+        cases.append((name, ok))
+        print(f"[{'ok' if ok else 'FAIL'}] {name}")
+        assert ok, name
+
+    with mock.patch.multiple(sys.modules[__name__], _init_web3=lambda: None, _ensure_setup=lambda: None, _htlc=htlc,
+                             _w3=w3, _eth_acct=mock.MagicMock(address='0xbank'), _send_tx=fake_send_tx,
+                             water_unlock_solidity=lambda param, d: sol_stub):
+        client = app.test_client()
+        cid_hex = cid.hex()
+
+        # /api/redelegate
+        for body in ({'denomination': 100}, {'contract_id': '', 'denomination': 100}, {}):
+            sent.clear()
+            r = client.post('/api/redelegate', json=body)
+            check(f"redelegate {body} -> 400, nothing sent", r.status_code == 400 and not sent)
+
+        sent.clear()
+        r = client.post('/api/redelegate', json={'contract_id': cid_hex, 'denomination': 100})
+        check("redelegate: denomination 100 on a 1-coin contract -> 400, nothing sent", r.status_code == 400 and not sent)
+
+        state['raise_on_withdraw'] = True
+        sent.clear()
+        r = client.post('/api/redelegate', json={'contract_id': cid_hex, 'denomination': 1})
+        check("redelegate: withdraw raises -> 500, newContract never called",
+              r.status_code == 500 and [f[0] for f, _ in sent] == ['withdraw'])
+        state['raise_on_withdraw'] = False
+
+        state['withdraw_status'] = 0
+        sent.clear()
+        r = client.post('/api/redelegate', json={'contract_id': cid_hex, 'denomination': 1})
+        check("redelegate: withdraw reverts (status 0) -> 500, newContract never called",
+              r.status_code == 500 and [f[0] for f, _ in sent] == ['withdraw'])
+        state['withdraw_status'] = 1
+
+        for hashlock in (2, 100):
+            state['hashlock'] = hashlock
+            sent.clear()
+            r = client.post('/api/redelegate', json={'contract_id': '0x' + cid_hex})  # no denomination in the request
+            check(f"redelegate: contract of denomination {hashlock}, no denomination sent -> new contract at {hashlock}",
+                  r.status_code == 200 and r.get_json() == {'contract_id': new_id.hex()}
+                  and [f[0] for f, _ in sent] == ['withdraw', 'newContract']
+                  and sent[1][0][1] == hashlock and sent[1][1] == w3.to_wei(_DENOM_ETH[hashlock], 'ether'))
+        state['hashlock'] = 1
+
+        sent.clear()
+        r = client.post('/api/redelegate', json={'contract_id': cid_hex, 'denomination': 1})
+        check("redelegate: honest request -> 200, withdraw then newContract at denomination 1",
+              r.status_code == 200 and [f[0] for f, _ in sent] == ['withdraw', 'newContract'] and sent[1][1] == w3.to_wei(0.01, 'ether'))
+
+        state['hashlock'] = 77
+        r = client.post('/api/redelegate', json={'contract_id': cid_hex})
+        check("redelegate: unsupported hashlock -> 400", r.status_code == 400)
+        state['hashlock'] = 1
+
+        state['withdrawn'] = True
+        r = client.post('/api/redelegate', json={'contract_id': cid_hex})
+        check("redelegate: already-withdrawn contract -> 400", r.status_code == 400)
+        state['withdrawn'] = False
+
+        # /api/pay
+        sent.clear()
+        r = client.post('/api/pay', json={'contract_id': '', 'denomination': 1})
+        check("pay: empty contract_id -> 400", r.status_code == 400 and not sent)
+        r = client.post('/api/pay', json={'contract_id': cid_hex, 'denomination': 100})
+        check("pay: denomination 100 on a 1-coin contract -> 400, nothing sent", r.status_code == 400 and not sent)
+        r = client.post('/api/pay', json={'contract_id': cid_hex, 'denomination': 'abc'})
+        check("pay: non-numeric denomination -> 400", r.status_code == 400 and not sent)
+        state['hashlock'] = 20
+        r = client.post('/api/pay', json={'contract_id': cid_hex})
+        check("pay: denomination derived from the contract, withdraw sent", r.status_code == 200 and [f[0] for f, _ in sent] == ['withdraw'])
+    print(f"Denomination trust test PASSED ({len(cases)} cases)")
 
 
 def main():

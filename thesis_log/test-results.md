@@ -226,3 +226,57 @@ unchanged and still pass.
 needs the protocol rule that the Bank completes the signature only while
 `height + CLAIM_MARGIN < timelock`. The margin must cover the claim's confirmation time on the
 real chain.
+
+---
+
+## Run 2026-10-26 (2) — Denomination forgery, Part 1: single-slot fixed tag bits in the GS circuit
+
+- **Code:** `a6b8971` plus uncommitted changes to `server/rustcode/src/lib.rs`
+  (`generate_gs_core`, `garble_waters_with_gs`), `server/rustcode/src/pbcrypto.rs`
+  (`evaluate_gs`), `server/server.py` (`_garble_with_gs`, `_garble_one_circuit`, callers,
+  `test_gs_full`). The Android copy of `evaluate_gs` was changed identically, not built or run.
+- **Environment:** WSL2 (Linux 6.18.54), CPython 3.12, `bash build.sh` (maturin, release).
+- **Command:** `python3 -c "from server import test_gs_full; test_gs_full()"`, then
+  `python3 -c "from server import test_redelegate_full; test_redelegate_full()"`.
+- **Randomness:** per-coin secrets from `rand::thread_rng()`; Waters parameters from the fixed seed.
+
+| # | Kind | Case | Expected | Observed | Result |
+|---|---|---|---|---|---|
+| D1.1 | positive | Mint (denomination 1), activate, re-delegate to `002_001_000` | Key verifies for that tag only; exactly 94 ECDH uses | As expected, 94 uses | PASS |
+| D1.2 | positive | Slot layout of a minted GS circuit | 40 bits (bytes 3–7, `_DDD_`) have one empty slot; all UUU and CCC bits keep both; `key_mat` and `slots_c` agree on which slot is empty | As expected | PASS |
+| D1.3 | positive | Re-delegate to another UUU and CCC (`017_001_123`), same denomination | Key verifies for that tag | Verifies | PASS |
+| D1.4 | negative | Denomination-1 coin evaluated at `002_100_000` | Error naming the fixed bit | `tag bit 32 (byte 4) is fixed by the coin to 0: no slot for 1` | PASS |
+| D1.5 | positive / negative | Denomination-100 coin at `002_100_000`, then at `002_001_000` | Succeeds, then error | Verifies, then error | PASS |
+| D1.6 | negative | GS opened with another coin's GWat key | Rejected | Rejected (AoN mismatch) | PASS |
+| D1.7 | negative | Any bit slot left unopened | Rejected | Rejected | PASS |
+| D1.8 | positive | Two coins, same device and tag | Independent masks and `r` | Independent | PASS |
+| D1.9 | regression | `test_redelegate_full` (Option-B path) | Passes | Passes | PASS |
+
+- **Totals:** 9 cases, 9 PASS, 0 FAIL.
+- **Not covered:** the Android build (`librust.so`) and a device run; on-chain enforcement, which
+  needs the tag-encoding fix first (client keys never pass the contract check).
+
+## Run 2026-10-26 (3) — Denomination forgery, Part 2: the server takes the denomination from the contract
+
+- **Code:** `a6b8971` plus uncommitted changes to `server/server.py` (`_BadRequest`,
+  `_contract_denomination`, `/api/redelegate`, `/api/pay`, new `test_denomination_trust`).
+- **Environment:** WSL2, CPython 3.12. Flask test client; `_htlc`, `_w3`, `_send_tx`,
+  `_init_web3`, `_ensure_setup` and `water_unlock_solidity` mocked, so no chain and no env vars.
+- **Command:** `python3 -c "from server import test_denomination_trust; test_denomination_trust()"`.
+
+| # | Kind | Case | Expected | Observed | Result |
+|---|---|---|---|---|---|
+| D2.1 | negative | `/api/redelegate` with no `contract_id`, empty `contract_id`, or `{denomination: 100}` only | 400, nothing sent | 400, nothing sent | PASS |
+| D2.2 | negative | `/api/redelegate`, `denomination: 100` on a denomination-1 contract | 400, nothing sent | 400, nothing sent | PASS |
+| D2.3 | negative | Withdrawal of the old contract raises | 500, `newContract` not called | 500, only `withdraw` sent | PASS |
+| D2.4 | negative | Withdrawal mined with status 0 | 500, `newContract` not called | 500, only `withdraw` sent | PASS |
+| D2.5 | positive | Contracts of denomination 2 and 100, no denomination in the request | New contract with the contract's hashlock and ETH amount | As expected | PASS |
+| D2.6 | positive | Honest request (denomination 1) | `withdraw`, then `newContract` for 0.01 ETH | As expected | PASS |
+| D2.7 | negative | Unsupported hashlock; already-withdrawn contract | 400 | 400 | PASS |
+| D2.8 | negative | `/api/pay`: empty `contract_id`; denomination 100 on a 1-coin contract; non-numeric denomination | 400, nothing sent | 400, nothing sent | PASS |
+| D2.9 | positive | `/api/pay` on a denomination-20 contract, no denomination sent | `withdraw` sent | As expected | PASS |
+
+- **Totals:** 15 assertions (the 9 rows above, with D2.1/D2.5/D2.7/D2.8 covering several),
+  15 PASS, 0 FAIL.
+- **Not covered:** a real Sepolia transaction. The mocks fix the contract's return shape from
+  `getContract` in `zfairexchange.sol`; the deployed contract at `HTLC_ADDRESS` is the old one.
