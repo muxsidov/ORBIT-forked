@@ -102,3 +102,59 @@ paid on a non-pairing chain without handing Alice the secret that decrypts her v
 Feasibility now rests on Q3: Part B, an ECDSA adaptor signature on secp256k1 that reveals `x`
 on-chain. Practical costs (proof size for offline QR handoff, phone-side timing) are Part C
 concerns, not feasibility blockers.
+
+## 2026-10-07 — Q3 answered on a simulated ledger: feasibility established at protocol level
+
+**Attempt:** Part B Steps B1–B2 (`ecdsa-adaptor-secp256k1.md`) implemented an ECDSA adaptor
+signature on secp256k1 and a two-signature bonding transaction on a simulated ledger, connected
+end to end with the Part A offer.
+
+**Result:** Success for Q3 at protocol level. Q1, Q2 and Q3 are all answered yes. No real chain
+has been used yet.
+
+**Details:** The Bank is paid only by publishing a standard ECDSA signature that reveals `x`.
+`x` decrypts the Waters key Alice verified before locking funds. Front-running by Alice,
+claiming without `x`, transaction substitution, early refunds and double spends are all
+rejected. 34/34 cases pass (`test-results.md`, run 2026-10-07 (3)). The completed signatures
+pass an independent standard verifier (k256) and Ethereum-style address recovery.
+
+**Why:** The chain only ever checks ordinary secp256k1 ECDSA signatures and a timelock. All
+BN254 and Waters work happens off-chain (Q1). The cross-group proof (Q2) guarantees the secret
+revealed on the chain's curve is the one that decrypts the key.
+
+**Implication:** Multi-chain support is feasible for any chain with secp256k1 ECDSA and a
+2-of-2-plus-timelock spending condition:
+- Bitcoin, in script.
+- EVM chains, with a contract using `ecrecover` and no pairing precompile.
+
+Chains on other curves need the matching adaptor scheme and bases. Schnorr/Taproot is simpler
+than ECDSA. ed25519 (Monero) needs a twisted-Edwards DLEQ variant.
+
+Remaining work is demonstration and engineering:
+- one real chain deployment (testnet);
+- Part C integration;
+- the practical costs already noted: the 55 KB proof for the offline QR handoff, and Alice's
+  secp256k1 key outside AndroidKeyStore.
+
+## 2026-10-26 — Verdict qualified: fairness needs a claim safety margin; identity binding open
+
+**Attempt:** Threat review of the Part A + B protocol (`ecdsa-adaptor-secp256k1.md`, same date),
+with new tests B2.12–B2.13.
+
+**Result:** Partial. The feasibility verdict stands with a stated condition, and one design gap
+is added.
+
+**Details:**
+- **Condition:** if the Bank claims after the timelock, Alice can take `x` from the mempool and
+  win the race with her refund (B2.12). Fairness holds when the Bank claims at least
+  `CLAIM_MARGIN` blocks before expiry (B2.13).
+- **Gap:** the key delivered by FDE is not bound to Alice's attested hardware.
+- **Requirements:** a confidential channel and authentication (signed offer, known Bank chain
+  key). These are design requirements, not feasibility blockers.
+
+**Why:** These are timing, channel and identity properties, outside what the adaptor signature
+guarantees. The same rules apply to every atomic-swap protocol.
+
+**Implication:** For the thesis, state the verdict as: multi-chain fair exchange is feasible
+with chain-native ECDSA, under a claim-margin rule and an authenticated, confidential channel.
+Binding the delivered key to the device is an open design question for Part C.

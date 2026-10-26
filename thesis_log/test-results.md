@@ -119,3 +119,110 @@ quoting. Alice's full check is the DLEQ verify plus the Step 3 verifier (~12 ms)
 
 **Not covered by this run:** a real on-chain reveal of `x` through an adaptor signature
 (Part B). The reveal in 4.2 is simulated by handing over `x` as a secp256k1 scalar.
+
+---
+
+## Run 2026-10-07 (3) — Part B, Steps B1–B2 (plus regression of Part A)
+
+- **Code:** `server/poc_adaptor_sig/`, commit `5952652` plus uncommitted `src/adaptor.rs`,
+  `src/bin/b1_ecdsa_adaptor.rs`, `src/bin/b2_bonding_ledger.rs`, `src/lib.rs` (module line), and
+  new dependencies `k256 0.13` (feature `ecdsa`), `sha3 0.10`.
+- **Environment:** WSL2 (Linux 6.18), rustc 1.94.1, `--release`.
+- **Randomness:** `ark_std::test_rng()` (fixed seed).
+- **Command:** `cargo run -q --release --bin <name>`; all six binaries (Steps 1–4, B1, B2)
+  exited 0.
+- **Regression:** Part A Steps 1–4 unchanged, all 30 cases PASS.
+- **Totals for Part B:** 34 cases (14 positive, 18 negative, 2 gap), 34 PASS, 0 FAIL.
+- **Independent verifier:** completed signatures are checked with `k256` (RustCrypto), a separate
+  ECDSA implementation from the arkworks code that produced them. It enforces low-s, as
+  Bitcoin policy does.
+
+### B1 — ECDSA adaptor signature on secp256k1 (`b1_ecdsa_adaptor`)
+
+Alice pre-signs a payment to the Bank under `Y_chain` (from the Step 4 offer). The Bank
+completes the signature with `x`; Alice extracts `x` and decrypts.
+
+| # | Kind | Case | Simulates | Expected | Observed | Result |
+|---|---|---|---|---|---|---|
+| B1.1a | positive | `pVerify` of Alice's honest pre-signature | Bank checks Alice's pre-signature | Accept | Accept | PASS |
+| B1.1b | positive | Completed signature, standard ECDSA verify (k256) | A chain verifying the Bank's payment | Accept | Accept | PASS |
+| B1.1c | positive | Completed signature, `ecrecover`-style recovery | Ethereum's signer recovery | Alice's address | Alice's address | PASS |
+| B1.1d | positive | Extract `x`, decrypt, Waters checks | Alice reads the chain and activates her key | `x` recovered; `sk3`; valid | As expected | PASS |
+| B1.2a | negative | Completed signature with high `s`, not normalised | Signature a chain would refuse (Bitcoin low-s rule) | Reject | Reject | PASS |
+| B1.2b | positive | Same signature low-s normalised | Bank normalises before broadcasting | Accept | Accept | PASS |
+| B1.2c | positive | Extract from the normalised signature | Alice extracts after normalisation (`s → n − s`) | `x` recovered | `x` recovered | PASS |
+| B1.3a | positive | Completed signature already low-s | No normalisation needed | Accept | Accept | PASS |
+| B1.3b | positive | Extract from it | Alice extracts | `x` recovered | `x` recovered | PASS |
+| B1.4 | negative | Pre-signature under a different `Y` | Alice pre-signs for a statement the Bank can't complete | Reject | Reject | PASS |
+| B1.5 | negative | Pre-signature checked against a different transaction | Pre-signature on the wrong payment | Reject | Reject | PASS |
+| B1.6 | negative | Pre-signature checked against a different key | Not Alice's key | Reject | Reject | PASS |
+| B1.7 | negative | `s'` tampered | Corrupted pre-signature | Reject | Reject | PASS |
+| B1.8 | gap | `R' ≠ k·Y` with `r`, `s'` recomputed; checks without the DLEQ proof | Alice sabotages: Bank would reveal `x` for an invalid signature | Passes non-DLEQ checks; completion invalid | As expected | PASS |
+| B1.9 | negative | Same pre-signature, full `pVerify` | The B1.8 attack against the real check | Reject | Reject | PASS |
+| B1.10 | negative | Completed with a wrong witness, standard verify | Bank without `x` | Reject | Reject | PASS |
+| B1.11 | negative | Completed with a wrong witness, recovery | Same, on Ethereum | Not Alice's address | Not Alice's | PASS |
+| B1.12 | negative | Extract using an unrelated pre-signature | Wrong pairing of signature and pre-signature | No `x` | None | PASS |
+| B1.13 | negative | Extract from a signature not made by `Adapt` | Unrelated signature | No `x` | None | PASS |
+
+**Measurement:** `pSign` 0.66 ms, `pVerify` 0.95 ms (single run, laptop).
+
+### B2 — two-signature bonding transaction on a simulated ledger (`b2_bonding_ledger`)
+
+Lock: claim needs Alice's (completed) signature **and** the Bank's ordinary signature on the
+same transaction, at any time while unspent. Refund needs Alice's signature and
+`height ≥ timelock`. The miner may order transactions adversarially.
+
+| # | Kind | Case | Simulates | Expected | Observed | Result |
+|---|---|---|---|---|---|---|
+| B2.1a | positive | Bank's claim with both signatures | Honest payment | Confirmed | Confirmed | PASS |
+| B2.1b | positive | Alice extracts `x` from the confirmed transaction | Alice activates her key | `sk3`; valid | As expected | PASS |
+| B2.2 | gap | Naive Alice-only lock; Alice front-runs the Bank's claim | The race the paper warns about | Alice keeps money and decrypts | As expected | PASS |
+| B2.3a | negative | Same front-run against the two-signature lock, mined first | Alice redirects funds after seeing `x` in the mempool | Reject | Reject (Bank sig invalid) | PASS |
+| B2.3b | positive | Bank's claim, mined second | Bank still paid | Confirmed | Confirmed | PASS |
+| B2.4 | negative | Claim with the un-completed pre-signature | Bank tries to get paid without `x` | Reject | Reject | PASS |
+| B2.5 | negative | Claim completed with a wrong witness | Bank tries to get paid without `x` | Reject | Reject | PASS |
+| B2.6 | negative | Alice's completed signature reused on a different transaction | Bank changes the transaction | Reject | Reject | PASS |
+| B2.7 | negative | Refund before the timelock | Alice reclaims too early | Reject | Reject | PASS |
+| B2.8 | positive | Refund after the timelock, Bank never claimed | Bank disappears | Confirmed; Alice refunded | As expected | PASS |
+| B2.9 | negative | Bank's claim after Alice refunded | Late claim on a spent lock | Reject | Reject | PASS |
+| B2.10a | positive | Late claim after expiry, mined before Alice's refund | Bitcoin-style: claim branch has no deadline | Confirmed | Confirmed | PASS |
+| B2.10b | negative | Alice's racing refund, mined second | Same race | Reject | Reject | PASS |
+| B2.10c | positive | Alice extracts `x` from the late claim | Outcome still fair | `sk3`; valid | As expected | PASS |
+| B2.11 | negative | Second claim on the same lock | Double spend | Reject | Reject | PASS |
+
+**Not covered by this run:** a real chain. The ledger, transaction format and script
+conditions are simulated. Only signature verification uses a standard implementation.
+
+---
+
+## Run 2026-10-26 — Part B, B2 timelock race (plus regression of everything)
+
+- **Code:** `server/poc_adaptor_sig/`, commit `5952652` plus uncommitted Part B files
+  (`src/adaptor.rs`, `src/bin/b1_ecdsa_adaptor.rs`, `src/bin/b2_bonding_ledger.rs`). This run
+  adds cases B2.12–B2.13 and the constant `CLAIM_MARGIN = 3` to `b2_bonding_ledger.rs`.
+- **Environment:** WSL2 (Linux 6.18.54), rustc 1.94.1, `--release`.
+- **Randomness:** `ark_std::test_rng()` (fixed seed).
+- **Command:** `cargo run -q --release --bin <name>`; all six binaries exited 0.
+- **Regression:** Part A (30 cases), B1 (19 cases) and B2.1–B2.11 (15 cases) unchanged, all
+  PASS.
+- **Totals for this run's new cases:** 5 cases (3 positive, 1 negative, 1 gap), 5 PASS, 0 FAIL.
+
+**Correction to run 2026-10-07 (3), row B2.10c.** That row reads "Outcome still fair". This holds
+only for the order tested, where the Bank's late claim is mined before Alice's refund. With the
+opposite order the outcome is unfair to the Bank (B2.12 below). The B2.10 rows themselves are
+unchanged and still pass.
+
+### B2.12–B2.13 — the late-claim race and the safety-margin fix (`b2_bonding_ledger`)
+
+| # | Kind | Case | Simulates | Expected | Observed | Result |
+|---|---|---|---|---|---|---|
+| B2.12 | gap | Bank claims after expiry; Alice reads `x` from the mempool and broadcasts her refund; miner picks the refund first | The Bank claims too late | Refund confirmed; claim rejected; Alice keeps her money and decrypts `sk3` | As expected | PASS |
+| B2.13a | positive | Bank asked to claim 3 blocks before expiry (`height + CLAIM_MARGIN ≥ timelock`) | The Bank follows the safety-margin rule | Bank declines; `x` never revealed | Declines | PASS |
+| B2.13b | positive | Alice's refund after expiry, Bank stayed silent | Refund without having learned `x` | Confirmed | Confirmed | PASS |
+| B2.13c | positive | Bank's claim inside the safety window | Honest, timely claim | Confirmed | Confirmed | PASS |
+| B2.13d | negative | Alice's refund once the timelock passes, after the timely claim | Refund after a confirmed claim | Reject | Reject (spent) | PASS |
+
+**What this shows:** the chain alone does not make the exchange fair near expiry. Fairness
+needs the protocol rule that the Bank completes the signature only while
+`height + CLAIM_MARGIN < timelock`. The margin must cover the claim's confirmation time on the
+real chain.

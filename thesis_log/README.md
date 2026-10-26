@@ -30,6 +30,14 @@ Monero, …): the three sub-questions Parts A/B answer, and the groups each obje
 - **Thesis use:** Introduction/Motivation (why leave Ethereum-only) and the opening of the
   HTLC-replacement design chapter; the groups table is a ready-made figure.
 
+### [ECDSA Adaptor Signature on secp256k1](ecdsa-adaptor-secp256k1.md)
+Part B of `CLAUDE_replace_HTLC.md`: the ECDSA adaptor signature and the two-signature bonding
+transaction that enforce "pay whoever reveals `x`" without pairings on-chain.
+- **Scope test:** adaptor-signature cryptography, bonding-transaction conditions, ledger or
+  chain experiments (simulated or testnet). Part A's VECK work stays in `elgamal-sk3-veck.md`.
+- **Thesis use:** System Design (on-chain enforcement) and Security Analysis. The front-running
+  gap (B2.2) and the DLEQ-sabotage gap (B1.8) show why each design element exists.
+
 ### [Test Results](test-results.md)
 Raw pass/fail tables of the research test programs (Part A Steps 1–3 so far): one row per case,
 with what it simulates, expected vs. observed, and the exact command/commit of each run.

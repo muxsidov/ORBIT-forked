@@ -54,12 +54,30 @@ open item — don't rely on re-reading old entries later to reconstruct what's s
 
 ## multichain-feasibility.md
 
-- **Q3 untested: on-chain enforcement.** No adaptor signature exists yet; the reveal of `x` is
-  simulated. Part B. Raised 2026-10-07.
+- **Part B on a real chain.** B1/B2 pass on a simulated ledger; not yet deployed as Bitcoin
+  script (testnet/regtest) or an EVM contract with two `ecrecover` checks. Which one to demo?
+  Raised 2026-10-07 (`ecdsa-adaptor-secp256k1.md`).
+- **Alice's secp256k1 key on Android.** AndroidKeyStore has no secp256k1, so the pre-signing key
+  would be a software key, outside the hardware protection the rest of ORBIT relies on. Accept
+  as a limitation, or another approach? Raised 2026-10-07.
 - **DLEQ proof size and speed for the offline handoff.** 55.4 KB and ~230 ms prove/verify on a
   laptop; doesn't fit the single-QR re-delegation handoff, and phone timing is unmeasured.
   Options: multi-QR/NFC/Bluetooth transport, or a more compact proof. Raised 2026-10-07
   ("Step 4: cross-group DLEQ...").
+
+## ecdsa-adaptor-secp256k1.md
+
+- **[design gap] Identity binding of the FDE-delivered key.** `sk3` is encrypted only under `x`,
+  so whoever pays and holds `x` plus the ciphertext gets a working key for Alice's tag; ORBIT's
+  hardware binding (dmk tied to the attested AndroidKeyStore key) is lost. Options: attestation
+  check before the Bank issues an offer, or additionally encrypt `sk3` to Alice's attested key
+  (may conflict with the pairing checks — needs analysis). Raised 2026-10-26 ("Threat review...").
+- **Confidential channel and authentication not specified.** Bank–Alice messages must be
+  confidential (eavesdropper with the pre-signature and ciphertext gets `sk3`); the offer must be
+  signed by the Bank and the Bank's chain key in the lock authenticated. Raised 2026-10-26.
+- **Claim safety margin on a real chain.** Fairness needs the Bank to claim while
+  `height + CLAIM_MARGIN < timelock` (B2.12/B2.13); the real value depends on confirmation times
+  and fee policy. Pick and justify it in the regtest/testnet step. Raised 2026-10-26.
 
 ## Tracked elsewhere (cross-reference only, not originated in thesis_log)
 

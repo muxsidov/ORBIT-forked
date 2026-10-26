@@ -161,6 +161,18 @@ Modeled on the Atomic & Fair Data paper's FDE flow, Bank = server, Alice = clien
    ```
    Alice now holds a valid `(sk1, sk2, sk3)` — dmk activated.
 
+**Protocol requirements found in the 2026-10-26 threat review**
+(`thesis_log/ecdsa-adaptor-secp256k1.md`):
+- **Claim safety margin.** The Bank completes the adaptor signature only while
+  `height + CLAIM_MARGIN < timelock`. A late claim leaks `x` in the mempool while Alice's
+  refund is valid, so Alice could get both her money and the key (test B2.12).
+- **Confidential channel.** Step 1's messages must be confidential. An eavesdropper holding the
+  pre-signature and the ciphertext can decrypt `sk3` after the claim.
+- **Authentication.** The Bank signs the offer, and Alice locks to an authenticated Bank chain
+  key.
+- **Identity binding (open).** `sk3` is bound only to `x`, not to Alice's attested hardware as
+  the dmk is today. See Part C.
+
 ## Re-delegation for free (Alice → Bob)
 
 Once Alice holds `sk3` in the clear (post-Step 5), she can play the Bank's role for Bob using
@@ -227,6 +239,13 @@ Part A is complete; the remaining feasibility risk is Part B. Zero blockchain/An
 
 ### Part B — one concrete adaptor-signature instantiation, on a real chain
 
+**Status 2026-10-07:** ECDSA adaptor (Fig. 5) and the two-signature lock are done on a
+**simulated ledger** — `src/adaptor.rs`, `src/bin/b1_ecdsa_adaptor.rs`,
+`src/bin/b2_bonding_ledger.rs` (34/34 cases, `thesis_log/test-results.md`). Completed signatures
+pass k256's standard verifier and Ethereum-style recovery. Remaining: a real chain (below).
+Findings: low-s normalisation is required (extract must try `±`); the pre-signature's DLEQ proof
+is load-bearing; the claim branch can't have a deadline in Bitcoin script (still fair).
+
 Once Part A confirms the VECK side works, implement one full adaptor-signature bonding
 transaction for real:
 
@@ -246,6 +265,19 @@ transaction for real:
   extract the witness or redirect funds before the Bank's real spend confirms.
 
 ### Part C — wire into ORBIT
+
+**Constraints found in Parts A/B (resolve before or during Part C; tracked in
+`thesis_log/open-questions.md`):**
+- The cross-group DLEQ proof is 55.4 KB, with ~230 ms prove/verify on a laptop and phone timing
+  unmeasured. It doesn't fit the single-QR offline handoff used for re-delegation today, so it
+  needs multi-QR/NFC/Bluetooth or a more compact proof.
+- Alice's pre-signing key must be secp256k1. AndroidKeyStore has no secp256k1, so it would be a
+  software key, outside the hardware protection used for the ORBIT attestation key.
+- **Identity binding.** The FDE-delivered `sk3` is bound to `x` only. Whoever pays gets a working
+  key for Alice's tag, which loses ORBIT's hardware binding. Options: an attestation check
+  before the Bank issues an offer, or encrypting `sk3` additionally to Alice's attested key.
+- Confidential, authenticated Bank–Alice channel (signed offer, known Bank chain key), and the
+  claim safety margin; see "Protocol requirements" above.
 
 - Add this as a **new path alongside** (not replacing) the existing `zfairexchange.sol` +
   pairing-check flow, so the current working Waters/RDelegate demo never breaks.
@@ -269,4 +301,5 @@ transaction for real:
   same role `hashlock` does today (binding a lock to a specific coin value).
 - **Decided 2026-10-07: `k = x`** (`x < 2^252`), see "Cross-group link". Read `H(x)` elsewhere in this doc as `x`.
 - The 55 KB DLEQ proof doesn't fit the single-QR offline handoff used for re-delegation; Part C needs another transport or a smaller proof.
-- Part A is done (`server/poc_adaptor_sig`, Steps 1–4; Step 5 covered by Step 4); Parts B and C not started.
+- Part A is done (`server/poc_adaptor_sig`, Steps 1–4; Step 5 covered by Step 4). Part B done on a simulated ledger (B1, B2); real-chain deployment and Part C not started.
+- Alice's pre-signing key must be secp256k1; AndroidKeyStore has no secp256k1, so it would be a software key on the phone (Part C).
