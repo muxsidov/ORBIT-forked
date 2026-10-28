@@ -9,6 +9,9 @@ __pycache__/
 server/rustcode/target/
 server/poc_adaptor_sig/target/
 
+# Test logs (server/run_tests.sh)
+server/test_logs/
+
 # Node
 node_modules/
 

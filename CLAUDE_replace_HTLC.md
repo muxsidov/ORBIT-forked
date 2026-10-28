@@ -242,7 +242,11 @@ Part A is complete; the remaining feasibility risk is Part B. Zero blockchain/An
 **Status 2026-10-07:** ECDSA adaptor (Fig. 5) and the two-signature lock are done on a
 **simulated ledger** — `src/adaptor.rs`, `src/bin/b1_ecdsa_adaptor.rs`,
 `src/bin/b2_bonding_ledger.rs` (34/34 cases, `thesis_log/test-results.md`). Completed signatures
-pass k256's standard verifier and Ethereum-style recovery. Remaining: a real chain (below).
+pass k256's standard verifier and Ethereum-style recovery.
+**Status 2026-10-26: done on a real chain** — `src/bin/b3_bitcoin_regtest.rs`, a P2WSH 2-of-2 +
+CLTV lock on Bitcoin Core v31.1 regtest (14/14 cases). Front-running is rejected by consensus;
+fairness needs the claim *confirmed* before the timelock (`CLAIM_MARGIN`, B3.11b). Needs
+`bitcoind -regtest -datadir=$HOME/btc-regtest -daemon -fallbackfee=0.0001` running.
 Findings: low-s normalisation is required (extract must try `±`); the pre-signature's DLEQ proof
 is load-bearing; the claim branch can't have a deadline in Bitcoin script (still fair).
 
@@ -265,6 +269,23 @@ transaction for real:
   extract the witness or redirect funds before the Bank's real spend confirms.
 
 ### Part C — wire into ORBIT
+
+**Status 2026-10-26: server side done, on Bitcoin regtest** (`test_fde_regtest`, 26/26).
+- `server/rustcode/src/fde.rs`: PyO3 wrappers over `poc_adaptor_sig`, which is a path
+  dependency; the shared transaction code is in `src/btc.rs`.
+- Endpoints `GET /api/fde/bank`, `POST /api/fde/offer` and `POST /api/fde/claim` in
+  `server.py`, alongside the HTLC flow.
+- Decisions:
+  - Bitcoin regtest first;
+  - identity binding by an attestation gate, with the attested key hash in the signed terms;
+  - authentication by Bank-signed terms and a pinned `bank_pk`;
+  - timelock 144 blocks, claim margin 12 blocks.
+- Not done:
+  - Android;
+  - a confidential channel;
+  - cryptographic identity binding;
+  - re-delegation over FDE;
+  - offer persistence.
 
 **Constraints found in Parts A/B (resolve before or during Part C; tracked in
 `thesis_log/open-questions.md`):**
@@ -301,5 +322,5 @@ transaction for real:
   same role `hashlock` does today (binding a lock to a specific coin value).
 - **Decided 2026-10-07: `k = x`** (`x < 2^252`), see "Cross-group link". Read `H(x)` elsewhere in this doc as `x`.
 - The 55 KB DLEQ proof doesn't fit the single-QR offline handoff used for re-delegation; Part C needs another transport or a smaller proof.
-- Part A is done (`server/poc_adaptor_sig`, Steps 1–4; Step 5 covered by Step 4). Part B done on a simulated ledger (B1, B2); real-chain deployment and Part C not started.
+- Part A is done (`server/poc_adaptor_sig`, Steps 1–4; Step 5 covered by Step 4). Part B done on a simulated ledger (B1, B2) and on Bitcoin Core regtest (B3, 2026-10-26); Part C server side done (2026-10-26), Android not started.
 - Alice's pre-signing key must be secp256k1; AndroidKeyStore has no secp256k1, so it would be a software key on the phone (Part C).

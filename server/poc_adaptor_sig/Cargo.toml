@@ -4,10 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Standalone crate, deliberately NOT part of `rustcode` — this is Part A of
-# CLAUDE_replace_HTLC.md, a crypto-only research POC with no PyO3/Python dependency,
-# so it can be iterated on and run with plain `cargo run --bin <name>` without touching
-# or risking the production `rustcode` extension build.
+# Research crate for CLAUDE_replace_HTLC.md, with no PyO3/Python dependency: Part A/B binaries
+# run with plain `cargo run --bin <name>`. Since Part C, `rustcode` uses this library (path
+# dependency) for the FDE purchase, so changes here need `build.sh` and the server tests too.
 
 [dependencies]
 ark-bn254 = "0.5"
@@ -16,6 +15,8 @@ ark-ff = "0.5"
 ark-secp256k1 = "0.5"
 ark-serialize = "0.5"
 ark-std = "0.5"
+bitcoin = "0.32"
 k256 = { version = "0.13", features = ["ecdsa"] }
+serde_json = "1"
 sha2 = "0.10"
 sha3 = "0.10"

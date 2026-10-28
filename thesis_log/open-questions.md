@@ -55,12 +55,13 @@ open item — don't rely on re-reading old entries later to reconstruct what's s
 
 ## multichain-feasibility.md
 
-- **Part B on a real chain.** B1/B2 pass on a simulated ledger; not yet deployed as Bitcoin
-  script (testnet/regtest) or an EVM contract with two `ecrecover` checks. Which one to demo?
-  Raised 2026-10-07 (`ecdsa-adaptor-secp256k1.md`).
 - **Alice's secp256k1 key on Android.** AndroidKeyStore has no secp256k1, so the pre-signing key
   would be a software key, outside the hardware protection the rest of ORBIT relies on. Accept
   as a limitation, or another approach? Raised 2026-10-07.
+- **FDE purchase on Android.** Part C runs with a scripted Alice (`test_fde_regtest`). The app
+  needs the Alice-side functions in JNI (`fde_verify_offer`, `fde_presign`, `fde_extract_decrypt`,
+  refund), a software secp256k1 key, a way to fund the lock, and a transport for the 114 KB offer.
+  Offers are kept only in server memory. Raised 2026-10-26 ("Part C: ... wired into the server").
 - **DLEQ proof size and speed for the offline handoff.** 55.4 KB and ~230 ms prove/verify on a
   laptop; doesn't fit the single-QR re-delegation handoff, and phone timing is unmeasured.
   Options: multi-QR/NFC/Bluetooth transport, or a more compact proof. Raised 2026-10-07
@@ -68,17 +69,32 @@ open item — don't rely on re-reading old entries later to reconstruct what's s
 
 ## ecdsa-adaptor-secp256k1.md
 
-- **[design gap] Identity binding of the FDE-delivered key.** `sk3` is encrypted only under `x`,
-  so whoever pays and holds `x` plus the ciphertext gets a working key for Alice's tag; ORBIT's
-  hardware binding (dmk tied to the attested AndroidKeyStore key) is lost. Options: attestation
-  check before the Bank issues an offer, or additionally encrypt `sk3` to Alice's attested key
-  (may conflict with the pairing checks — needs analysis). Raised 2026-10-26 ("Threat review...").
-- **Confidential channel and authentication not specified.** Bank–Alice messages must be
-  confidential (eavesdropper with the pre-signature and ciphertext gets `sk3`); the offer must be
-  signed by the Bank and the Bank's chain key in the lock authenticated. Raised 2026-10-26.
-- **Claim safety margin on a real chain.** Fairness needs the Bank to claim while
-  `height + CLAIM_MARGIN < timelock` (B2.12/B2.13); the real value depends on confirmation times
-  and fee policy. Pick and justify it in the regtest/testnet step. Raised 2026-10-26.
+- **[design gap] Identity binding of the FDE-delivered key — gate implemented, binding open.**
+  `/api/fde/offer` now issues offers only to an attested device and records the attested key's
+  hash in the signed terms (Part C, 2026-10-26). The delivered `sk3` is still bound to `x` only:
+  whoever pays and holds the ciphertext gets a working key. Cryptographic binding (also encrypting
+  `sk3` to the attested key) is unanalysed. Raised 2026-10-26 ("Threat review...").
+- **Confidential channel not specified.** Authentication is done in Part C (Bank-signed terms,
+  pinned `bank_pk`, Alice rebuilds the lock address herself). Confidentiality is not: the offer
+  travels over plain HTTP, and an eavesdropper with the ciphertext and the pre-signature gets
+  `sk3` after the claim. Needs TLS or encryption to Alice's key. Raised 2026-10-26.
+- **Claim safety margin on a real chain.** Fairness needs the Bank's claim *confirmed* before
+  the timelock, not just broadcast: on regtest an unconfirmed claim 4 blocks early is replaced by
+  Alice's refund under full-RBF (B3.11b). The Bank cannot raise the pre-signed fee (only CPFP).
+  Proposed, not measured: ~144-block timelock, ~12-block margin, Alice pre-signs at a generous
+  fee or several fee levels. Measure confirmation delays on a public testnet, or argue the value
+  from fee data. Raised 2026-10-26; narrowed 2026-10-26 ("B3: ... regtest").
+
+## two-bank-refund-design.md
+
+- **Two-bank payback path not designed.** Supervisor's proposal: Alice pays two banks half each,
+  an exchange coordinates, at least one bank is honest, everything on Bitcoin. Open: the refund
+  scripts, how `x` is shared, the exchange's role, and the payout rule ("whoever provides the …
+  is paid" is incomplete in the source). Raised 2026-10-27 ("Problem statement...").
+- **No coin holder is ever paid.** Sepolia: every HTLC's receiver is the Bank's own address, so
+  Withdraw pays the Bank back. Bitcoin FDE: no redemption step exists. Bob paying Alice on
+  re-delegation is designed but not implemented. Part of the two-bank design scope. Raised
+  2026-10-27 ("Gap: no coin holder is ever paid...").
 
 ## Tracked elsewhere (cross-reference only, not originated in thesis_log)
 

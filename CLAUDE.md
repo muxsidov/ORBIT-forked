@@ -59,6 +59,13 @@ They must be exported in the same shell that runs the server. `server.py` consta
 a server restart; `rustcode/` changes need `build.sh`; changes under
 `paymentbox_otp/app/rust/` need a manual `librust.so` rebuild (`CLAUDE_android.md`).
 
+**Tests:** `bash server/run_tests.sh [poc|chain|server] [--build]` prints one summary line per
+test; full logs go to `server/test_logs/`.
+- `chain` starts `bitcoind -regtest` if needed.
+- `--build` reruns `build.sh` first.
+- Recorded results are in `thesis_log/test-results.md`; re-run a group only when its code
+  changed.
+
 **Phone ↔ server:** `adb reverse tcp:5000 tcp:5000` (recommended; re-run after each reconnect),
 or Wi-Fi via Windows port-proxy to the WSL IP:
 `netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=5000 connectaddress=<WSL-IP> connectport=5000`
@@ -76,6 +83,11 @@ or Wi-Fi via Windows port-proxy to the WSL IP:
   server-derived key → `{tx_hash, contract_id}`.
 - `POST /api/redelegate {contract_id, denomination}` — legacy path: withdraw the old HTLC, create
   a new one.
+- `GET /api/fde/bank`, `POST /api/fde/offer {attestation, denomination, alice_pk, user_id}`,
+  `POST /api/fde/claim {offer_id, txid, vout, presig}` — FDE purchase on Bitcoin regtest (Part C
+  of `CLAUDE_replace_HTLC.md`), alongside the HTLC flow. Needs
+  `bitcoind -regtest -datadir=$HOME/btc-regtest -daemon -fallbackfee=0.0001` (override with
+  `BTC_DATADIR`); Bank key from `BTC_BANK_KEY` or fresh per run. Test: `test_fde_regtest()`.
 - Also: `/api/delegatedpresigecdsa` (ECDSA variant), `/api/waters_solidity_params` (used by
   `ztest_htlc.ipynb`), `/api/verifyattest`, `/api/register`, `/api/benchmarkdelegateecdsa`
   (heavy — 100 iterations).
@@ -132,5 +144,6 @@ Full list and status in `thesis_log/open-questions.md`; details in the topic fil
 - Full paper redemption flow: `DSign` → `zecdsa.sol` (blocked by the secp256r1/secp256k1
   mismatch — `CLAUDE_contracts.md`).
 - Real purchase flow: Alice locks her own ETH and the bank reveals the key on-chain.
-- HTLC → adaptor-signature replacement (`CLAUDE_replace_HTLC.md`).
+- HTLC → adaptor-signature replacement (`CLAUDE_replace_HTLC.md`): server side done on Bitcoin
+  regtest; next is the Android client.
 - Re-expose the ECDSA variant in the UI.

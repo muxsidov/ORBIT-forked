@@ -2,6 +2,7 @@
 //! inline copy so it stays exactly as recorded in the thesis log.
 
 pub mod adaptor;
+pub mod btc;
 pub mod dleq;
 pub mod veck;
 

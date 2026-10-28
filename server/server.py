@@ -11,6 +11,7 @@ from base64 import urlsafe_b64encode, urlsafe_b64decode
 from flask import Flask, session, request, redirect, abort, jsonify
 
 from rustcode import test_evaluate_gs, test_verify_gs_key, test_water, test_ecdsa, test_activate, test_unlock, test_dsign_local, test_rdelegate_local, garble_waters, garble_redelegate, garble_ecdsa, generate_params_waters,generate_params_ecdsa, test_encrypt, water_unlock_solidity, water_derive_ak, garble_waters_with_gs, decompress_waters_key
+from rustcode import fde_keypair, fde_pubkey, fde_sign, fde_verify_sig, fde_make_offer, fde_verify_offer, btc_lock, btc_p2wpkh_address, btc_spend, fde_presign, fde_complete_claim, btc_sign_refund, fde_extract_decrypt
 # poseidon
 
 import os
@@ -580,6 +581,145 @@ def pay():
             'tx_hash':     receipt_withdraw['transactionHash'].hex(),
             'contract_id': contract_id_hex,
         })
+    except _BadRequest as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── FDE purchase on Bitcoin regtest (Part C of CLAUDE_replace_HTLC.md) ───────
+# Alternative to the zfairexchange.sol HTLC, alongside it: Alice buys a coin by fair exchange.
+# The Bank sends a signed offer (encrypted Waters key, Y_chain = x·G, cross-group proof); Alice
+# checks it, locks BTC in a two-signature P2WSH output and pre-signs the Bank's claim; the claim
+# reveals x on-chain and Alice decrypts sk3 herself. No pairing on-chain, no beta_secret to Alice.
+# Regtest only: bitcoind -regtest -datadir=$BTC_DATADIR (thesis_log/ecdsa-adaptor-secp256k1.md).
+import subprocess
+import secrets
+
+BTC_DATADIR = os.environ.get("BTC_DATADIR", os.path.expanduser("~/btc-regtest"))
+# Bank's secp256k1 chain key; Alice must know the public key in advance (shipped with the app).
+# Without BTC_BANK_KEY a fresh key is drawn per server run, so open offers die with the server.
+_FDE_BANK_SK = os.environ.get("BTC_BANK_KEY", "") or fde_keypair()[0]
+_FDE_BANK_PK = fde_pubkey(_FDE_BANK_SK)
+_FDE_PAYOUT = btc_p2wpkh_address(_FDE_BANK_PK)
+_DENOM_SAT = {d: round(v * 100_000_000) for d, v in _DENOM_ETH.items()}  # same nominal amounts, in BTC
+FDE_TIMELOCK_BLOCKS = 144  # ~1 day on mainnet
+FDE_CLAIM_MARGIN = 12      # the claim must CONFIRM before the timelock (B3.11b); ~2 h on mainnet
+FDE_MIN_CONF = 1
+FDE_CLAIM_FEE = 1_000      # sat; fixed by Alice's pre-signature (SIGHASH_ALL)
+
+# offer_id -> {"terms": dict, "x": hex, "state": "offered" | "claimed" | "expired"}
+_fde_offers: dict = {}
+
+def _btc(*args):
+    out = subprocess.run(["bitcoin-cli", "-regtest", f"-datadir={BTC_DATADIR}", *args], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip())
+    return out.stdout.strip()
+
+@app.route('/api/fde/bank', methods=['GET'])
+def fde_bank():
+    """The Bank's chain key and lock parameters (Alice pins bank_pk)."""
+    return jsonify({'bank_pk': _FDE_BANK_PK, 'network': 'regtest', 'denominations_sat': _DENOM_SAT,
+                    'timelock_blocks': FDE_TIMELOCK_BLOCKS, 'claim_margin': FDE_CLAIM_MARGIN,
+                    'claim_fee': FDE_CLAIM_FEE})
+
+@app.route('/api/fde/offer', methods=['POST'])
+def fde_offer():
+    """Issue a signed offer for one coin to an attested device.
+
+    Body: {"attestation": [cert, ...], "denomination": N, "alice_pk": hex, "user_id": U}
+    Returns: {"terms": canonical JSON string, "sig": Bank's ECDSA signature over it}
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        if not body.get('attestation'):
+            raise _BadRequest('attestation missing')
+        # Identity binding (gate): offers go only to an attested AndroidKeyStore key.
+        try:
+            is_valid_att, attested_pk, _nusecount = verify_attestation(body['attestation'])
+        except Exception:
+            is_valid_att = False
+        if not is_valid_att:
+            return jsonify({'error': 'attestation rejected'}), 403
+        try:
+            denomination = int(body.get('denomination', 1))
+            user_id = int(body.get('user_id', 0))
+        except (TypeError, ValueError):
+            raise _BadRequest('denomination and user_id must be integers')
+        if denomination not in _DENOM_SAT:
+            raise _BadRequest(f'unsupported denomination {denomination}')
+        alice_pk = body.get('alice_pk') or ''
+        timelock = int(_btc('getblockcount')) + FDE_TIMELOCK_BLOCKS
+        try:
+            lock = json.loads(btc_lock(alice_pk, _FDE_BANK_PK, timelock))
+        except ValueError as e:
+            raise _BadRequest(f'alice_pk: {e}')
+        tag = make_tag(denomination, user_id)
+        made = json.loads(fde_make_offer(water_parameter, tag))
+        offer_id = secrets.token_hex(16)
+        terms = {
+            'offer_id': offer_id, 'tag': tag, 'denomination': denomination,
+            'amount_sat': _DENOM_SAT[denomination], 'timelock': timelock,
+            'lock_address': lock['address'], 'lock_script': lock['script'],
+            'payout_address': _FDE_PAYOUT, 'claim_fee': FDE_CLAIM_FEE,
+            'alice_pk': alice_pk, 'bank_pk': _FDE_BANK_PK,
+            'attested_key': sha256(attested_pk.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)).hex(),
+            'offer': made['offer'],
+        }
+        terms_str = json.dumps(terms, sort_keys=True, separators=(',', ':'))
+        _fde_offers[offer_id] = {'terms': terms, 'x': made['x'], 'state': 'offered'}
+        print(f"[FDE] offer {offer_id} tag={tag} amount={terms['amount_sat']} sat timelock={timelock}")
+        return jsonify({'terms': terms_str, 'sig': fde_sign(_FDE_BANK_SK, terms_str)})
+    except _BadRequest as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/fde/claim', methods=['POST'])
+def fde_claim():
+    """Claim Alice's lock, revealing x: check the lock on-chain and her pre-signature, complete it.
+
+    Body: {"offer_id": id, "txid": hex, "vout": n, "presig": {...}}
+    Returns: {"txid": claim txid}. 409 if not yet confirmed, already claimed, or too close to
+    the timelock (the Bank then never reveals x for this offer, and Alice refunds).
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        rec = _fde_offers.get(body.get('offer_id') or '')
+        if rec is None:
+            return jsonify({'error': 'unknown offer'}), 404
+        if rec['state'] != 'offered':
+            return jsonify({'error': f"offer already {rec['state']}"}), 409
+        t = rec['terms']
+        try:
+            txid, vout = str(body['txid']), int(body['vout'])
+            presig = body['presig'] if isinstance(body['presig'], str) else json.dumps(body['presig'])
+        except (KeyError, TypeError, ValueError):
+            raise _BadRequest('txid, vout and presig required')
+
+        utxo = _btc('gettxout', txid, str(vout)) if all(c in '0123456789abcdef' for c in txid) and len(txid) == 64 else ''
+        if not utxo:
+            raise _BadRequest('lock output not found or already spent')
+        utxo = json.loads(utxo)
+        if utxo['scriptPubKey'].get('address') != t['lock_address'] or round(utxo['value'] * 100_000_000) != t['amount_sat']:
+            raise _BadRequest('output is not the agreed lock (address or amount differs)')
+        if utxo['confirmations'] < FDE_MIN_CONF:
+            return jsonify({'error': 'lock not confirmed yet'}), 409
+        height = int(_btc('getblockcount'))
+        if not height + FDE_CLAIM_MARGIN < t['timelock']:
+            rec['state'] = 'expired'
+            return jsonify({'error': f"too close to the timelock ({height} + {FDE_CLAIM_MARGIN} >= {t['timelock']}); not revealing x"}), 409
+
+        unsigned = json.loads(btc_spend(t['lock_script'], txid, vout, t['amount_sat'], t['payout_address'], t['claim_fee'], 0))
+        try:
+            claim_hex = fde_complete_claim(unsigned['tx'], t['lock_script'], t['amount_sat'], t['alice_pk'],
+                                           t['offer']['y_chain'], presig, rec['x'], _FDE_BANK_SK)
+        except ValueError as e:
+            raise _BadRequest(str(e))
+        claim_txid = _btc('sendrawtransaction', claim_hex)
+        rec['state'] = 'claimed'
+        print(f"[FDE] claimed offer {t['offer_id']}: {claim_txid}")
+        return jsonify({'txid': claim_txid})
     except _BadRequest as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
@@ -1353,6 +1493,183 @@ def test_denomination_trust():
         check("pay: denomination derived from the contract, withdraw sent", r.status_code == 200 and [f[0] for f, _ in sent] == ['withdraw'])
     print(f"Denomination trust test PASSED ({len(cases)} cases)")
 
+
+def test_fde_regtest():
+    """Part C: buy a coin by fair exchange on Bitcoin regtest through /api/fde/* (Flask test client).
+
+    The test plays Alice: her own secp256k1 key, the node's wallet to fund the lock, the node to
+    read the chain. Only verify_attestation is mocked. Needs bitcoind running:
+      bitcoind -regtest -datadir=$HOME/btc-regtest -daemon -fallbackfee=0.0001
+    Run: python3 -c "from server import test_fde_regtest; test_fde_regtest()"
+    """
+    from unittest import mock
+
+    def wallet(*args):
+        return _btc('-rpcwallet=orbit', *args)
+    def mine(n=1):
+        _btc('generatetoaddress', str(n), wallet('getnewaddress'))
+    def mine_to(h):
+        n = h - int(_btc('getblockcount'))
+        if n > 0:
+            mine(n)
+    try:
+        _btc('getblockcount')
+    except Exception as e:
+        print(f"[SKIP] bitcoind regtest not reachable: {e}")
+        return
+    try:
+        _btc('createwallet', 'orbit')
+    except RuntimeError:
+        try:
+            _btc('loadwallet', 'orbit')
+        except RuntimeError:
+            pass  # already loaded
+    if float(wallet('getbalance')) < 1.0:
+        mine(101)
+
+    device = ec.generate_private_key(ec.SECP256R1())  # the attested AndroidKeyStore key
+    fake_verify = lambda att: (att == ['valid-chain'], device.public_key(), _GS_NUSECOUNT)
+    client = app.test_client()
+    alice_sk, alice_pk = fde_keypair()
+    params_public = json.loads(water_parameter)
+    params_public.pop('beta_secret')
+    params_public = json.dumps(params_public)
+    results = []
+    def check(name, cond):
+        assert cond, name
+        results.append(name)
+        print(f"[ok] {name}")
+
+    def fund(terms):
+        txid = wallet('sendtoaddress', terms['lock_address'], f"{terms['amount_sat'] / 1e8:.8f}")
+        tx = json.loads(_btc('getrawtransaction', txid, 'true'))
+        vout = next(o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address') == terms['lock_address'])
+        return txid, vout
+    def claim_sighash(terms, txid, vout, to=None):
+        return json.loads(btc_spend(terms['lock_script'], txid, vout, terms['amount_sat'],
+                                    to or terms['payout_address'], terms['claim_fee'], 0))['sighash']
+    def spent_in_tip(txid, vout):
+        block = json.loads(_btc('getblock', _btc('getbestblockhash'), '2'))
+        return next((t for t in block['tx'] if any(i.get('txid') == txid and i.get('vout') == vout for i in t['vin'])), None)
+
+    with mock.patch.object(sys.modules[__name__], 'verify_attestation', side_effect=fake_verify):
+        # ---- C1 Alice pins the Bank's chain key ----
+        bank = client.get('/api/fde/bank').get_json()
+        bank_pk = bank['bank_pk']
+        check("C1 Bank key and lock parameters published", bank['claim_margin'] == FDE_CLAIM_MARGIN)
+
+        # ---- C2 attestation gate ----
+        r = client.post('/api/fde/offer', json={'attestation': ['forged'], 'denomination': 1, 'alice_pk': alice_pk})
+        check("C2 offer to a device with a rejected attestation -> 403", r.status_code == 403)
+        r = client.post('/api/fde/offer', json={'denomination': 1, 'alice_pk': alice_pk})
+        check("C2 offer without attestation -> 400", r.status_code == 400)
+        r = client.post('/api/fde/offer', json={'attestation': ['valid-chain'], 'denomination': 1, 'alice_pk': 'zz'})
+        check("C2 offer with a malformed Alice key -> 400", r.status_code == 400)
+
+        # ---- C3 honest offer; Alice's checks before she pays ----
+        def get_offer(denomination=1):
+            r = client.post('/api/fde/offer', json={'attestation': ['valid-chain'], 'denomination': denomination,
+                                                    'alice_pk': alice_pk, 'user_id': 7})
+            assert r.status_code == 200, r.get_json()
+            return r.get_json()
+        resp = get_offer(2)
+        terms_str, sig = resp['terms'], resp['sig']
+        terms = json.loads(terms_str)
+        check("C3 offer signed by the pinned Bank key", fde_verify_sig(bank_pk, terms_str, sig))
+        check("C3 terms carry no beta_secret", 'beta_secret' not in terms_str)
+        expected_lock = json.loads(btc_lock(alice_pk, bank_pk, terms['timelock']))
+        check("C3 lock address rebuilt by Alice matches the terms",
+              expected_lock['address'] == terms['lock_address'] and expected_lock['script'] == terms['lock_script'])
+        check("C3 amount matches the denomination", terms['amount_sat'] == _DENOM_SAT[2] and terms['tag'] == make_tag(2, 7))
+        check("C3 offer bound to the attested device key",
+              terms['attested_key'] == sha256(device.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)).hex())
+        t0 = time.time()
+        ok = fde_verify_offer(params_public, terms['tag'], json.dumps(terms['offer']))
+        check(f"C3 encrypted key + cross-group proof verify with public params ({(time.time() - t0) * 1000:.0f} ms, "
+              f"offer {len(json.dumps(terms['offer']))} bytes)", ok)
+
+        # ---- C4 Alice refuses tampered offers ----
+        bad = dict(terms, amount_sat=1)
+        check("C4 terms altered in transit fail the Bank signature",
+              not fde_verify_sig(bank_pk, json.dumps(bad, sort_keys=True, separators=(',', ':')), sig))
+        other = json.loads(get_offer(2)['terms'])
+        mixed = dict(terms['offer'], c2=other['offer']['c2'])
+        check("C4 ciphertext from another offer fails verification",
+              not fde_verify_offer(params_public, terms['tag'], json.dumps(mixed)))
+        mixed = dict(terms['offer'], y_chain=other['offer']['y_chain'])
+        check("C4 Y_chain from another offer fails the cross-group proof",
+              not fde_verify_offer(params_public, terms['tag'], json.dumps(mixed)))
+        check("C4 key offered for another tag fails verification",
+              not fde_verify_offer(params_public, make_tag(100, 7), json.dumps(terms['offer'])))
+
+        # ---- C5 Alice locks; the Bank waits for confirmation ----
+        txid, vout = fund(terms)
+        presig = fde_presign(alice_sk, claim_sighash(terms, txid, vout), terms['offer']['y_chain'])
+        r = client.post('/api/fde/claim', json={'offer_id': terms['offer_id'], 'txid': txid, 'vout': vout, 'presig': presig})
+        check("C5 claim before the lock confirms -> 409", r.status_code == 409)
+        mine(1)
+
+        # ---- C6/C7 the Bank rejects a bad pre-signature or a wrong output ----
+        wrong = fde_presign(alice_sk, claim_sighash(terms, txid, vout, to=btc_p2wpkh_address(alice_pk)), terms['offer']['y_chain'])
+        r = client.post('/api/fde/claim', json={'offer_id': terms['offer_id'], 'txid': txid, 'vout': vout, 'presig': wrong})
+        check("C6 pre-signature on a different transaction -> 400, nothing broadcast",
+              r.status_code == 400 and 'pre-signature invalid' in r.get_json()['error']
+              and _btc('gettxout', txid, str(vout)) != '')
+        # Alice underfunds: the right lock address, 1000 sat short.
+        short_txid = wallet('sendtoaddress', terms['lock_address'], f"{(terms['amount_sat'] - 1000) / 1e8:.8f}")
+        short_vout = next(o['n'] for o in json.loads(_btc('getrawtransaction', short_txid, 'true'))['vout']
+                          if o['scriptPubKey'].get('address') == terms['lock_address'])
+        mine(1)
+        short_presig = fde_presign(alice_sk, claim_sighash(terms, short_txid, short_vout), terms['offer']['y_chain'])
+        r = client.post('/api/fde/claim', json={'offer_id': terms['offer_id'], 'txid': short_txid, 'vout': short_vout, 'presig': short_presig})
+        check("C7 claim against an underfunded lock -> 400 (not the agreed lock)",
+              r.status_code == 400 and 'not the agreed lock' in r.get_json()['error'])
+
+        # ---- C8 honest claim; Alice extracts x from the block and decrypts ----
+        r = client.post('/api/fde/claim', json={'offer_id': terms['offer_id'], 'txid': txid, 'vout': vout, 'presig': presig})
+        check("C8 Bank's claim accepted by the node", r.status_code == 200)
+        mine(1)
+        spend = spent_in_tip(txid, vout)
+        check("C8 claim confirmed, paying the Bank's payout address",
+              spend is not None and spend['vout'][0]['scriptPubKey']['address'] == terms['payout_address'])
+        key = json.loads(fde_extract_decrypt(spend['hex'], presig, json.dumps(terms['offer'])))
+        sk = [bytes.fromhex(key[k]) for k in ('sk1', 'sk2', 'sk3')]
+        check("C8 Alice decrypts sk3 from x read on-chain; the key verifies for her tag",
+              test_verify_gs_key(water_parameter, terms['tag'], *sk))
+        check("C8 ... and not for another tag", not test_verify_gs_key(water_parameter, make_tag(2, 8), *sk))
+
+        # ---- C9 one claim per offer ----
+        r = client.post('/api/fde/claim', json={'offer_id': terms['offer_id'], 'txid': txid, 'vout': vout, 'presig': presig})
+        check("C9 second claim on the same offer -> 409", r.status_code == 409)
+
+        # ---- C10 margin: the Bank stays silent near the timelock; Alice refunds ----
+        terms = json.loads(get_offer(1)['terms'])
+        txid, vout = fund(terms)
+        mine(1)
+        presig = fde_presign(alice_sk, claim_sighash(terms, txid, vout), terms['offer']['y_chain'])
+        mine_to(terms['timelock'] - FDE_CLAIM_MARGIN)
+        r = client.post('/api/fde/claim', json={'offer_id': terms['offer_id'], 'txid': txid, 'vout': vout, 'presig': presig})
+        check(f"C10 claim within {FDE_CLAIM_MARGIN} blocks of the timelock -> 409, x not revealed",
+              r.status_code == 409 and _btc('gettxout', txid, str(vout)) != '')
+        refund = json.loads(btc_spend(terms['lock_script'], txid, vout, terms['amount_sat'],
+                                      btc_p2wpkh_address(alice_pk), terms['claim_fee'], terms['timelock']))
+        signed = btc_sign_refund(refund['tx'], terms['lock_script'], terms['amount_sat'], alice_sk)
+        try:
+            _btc('sendrawtransaction', signed)
+            early = True
+        except RuntimeError as e:
+            early = 'non-final' not in str(e)
+        check("C10 Alice's refund before the timelock is rejected (non-final)", not early)
+        mine_to(terms['timelock'])
+        _btc('sendrawtransaction', signed)
+        mine(1)
+        spend = spent_in_tip(txid, vout)
+        check("C10 Alice's refund at the timelock confirms", spend is not None
+              and spend['vout'][0]['scriptPubKey']['address'] == btc_p2wpkh_address(alice_pk))
+        r = client.post('/api/fde/claim', json={'offer_id': terms['offer_id'], 'txid': txid, 'vout': vout, 'presig': presig})
+        check("C10 later claim on the expired offer -> 409", r.status_code == 409)
+
+    print(f"\ntest_fde_regtest PASSED: {len(results)} checks at regtest height {_btc('getblockcount')}")
 
 def main():
     # benchmark_delegation_noserver()

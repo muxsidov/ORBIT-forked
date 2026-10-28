@@ -280,3 +280,74 @@ real chain.
   15 PASS, 0 FAIL.
 - **Not covered:** a real Sepolia transaction. The mocks fix the contract's return shape from
   `getContract` in `zfairexchange.sol`; the deployed contract at `HTLC_ADDRESS` is the old one.
+
+## Run 2026-10-26 (4) — Part B, B3: the two-signature lock on Bitcoin Core regtest (plus regression)
+
+- **Code:** `server/poc_adaptor_sig/`, commit `b9615c9` plus uncommitted
+  `src/bin/b3_bitcoin_regtest.rs` and new dependencies `bitcoin 0.32`, `serde_json 1`.
+- **Environment:** WSL2 (Linux 6.18), rustc 1.94.1, `--release`; Bitcoin Core v31.1.0,
+  `bitcoind -regtest -datadir=$HOME/btc-regtest -daemon -fallbackfee=0.0001` (full-RBF on by
+  default). RPC through `bitcoin-cli`.
+- **Randomness:** `ark_std::test_rng()` (fixed seed); the run is repeatable on the same chain.
+- **Command:** `cargo run -q --release --bin b3_bitcoin_regtest`; exited 0 twice (heights
+  101→154 and 154→207), ~6 s per run. Regression: Steps 1–4, B1, B2 all exited 0.
+
+Lock: P2WSH, witness script (112–113 bytes)
+`IF <Alice> CHECKSIGVERIFY <Bank> CHECKSIG ELSE <timelock> CHECKLOCKTIMEVERIFY DROP <Alice> CHECKSIG ENDIF`,
+funded with 1 000 000 sat, timelock = funding height + 10. Both signatures are over the BIP143
+`SIGHASH_ALL` digest; Alice's is the adaptor pre-signature under `Y_chain`, completed by the
+Bank with `x`. Claim tx: 148 vbytes, fee 1 000 sat; racing transactions pay 10 000 sat. Alice
+reads the spend of her outpoint from `getrawmempool` / the tip block, never from the Bank.
+
+| # | Kind | Case | Expected | Observed | Result |
+|---|---|---|---|---|---|
+| B3.1 | positive | Bank's claim (adapted sig + Bank sig); Alice extracts `x` from the block and decrypts `sk3` | Accepted, confirmed, Bank paid, `sk3` passes the Waters checks | As expected | PASS |
+| B3.2a | negative | Alice's higher-fee redirect to herself, reusing the Bank's signature seen in the mempool | Rejected | `mempool-script-verify-flag-failed` (NULLFAIL) | PASS |
+| B3.2b | negative | Same redirect put directly into a block by a miner (`generateblock`) | Rejected by consensus | `TestBlockValidity failed: block-script-verify-flag-failed` (false top stack element) | PASS |
+| B3.3 | gap | Alice-only lock: Bank's claim, then Alice's higher-fee redirect after extracting `x` from the mempool | Redirect replaces the claim (full-RBF) | Replaced; Alice paid and holds `sk3` | PASS (gap reproduced) |
+| B3.4 | negative | Claim with the un-adapted pre-signature | Rejected | Script failure (NULLFAIL) | PASS |
+| B3.5 | negative | Claim completed with a wrong witness `x + 1` | Rejected | Script failure (NULLFAIL) | PASS |
+| B3.6 | negative | Alice's adapted signature reused on a claim with a different fee | Rejected | Script failure (NULLFAIL) | PASS |
+| B3.7a | negative | Refund before the timelock | Rejected | `non-final` | PASS |
+| B3.7b | negative | Refund with nLockTime below the script timelock | Rejected | `Locktime requirement not satisfied` | PASS |
+| B3.8 | positive | Refund at the timelock, Bank never claimed | Accepted, Alice paid | As expected | PASS |
+| B3.9 | negative | Bank's valid claim after the refund | Rejected | `bad-txns-inputs-missingorspent` | PASS |
+| B3.10 | gap | Late claim after expiry; Alice extracts `x` from the mempool and broadcasts a higher-fee refund | Refund replaces the claim | Replaced; Alice paid and holds `sk3` | PASS (gap reproduced) |
+| B3.11a | positive | Claim `CLAIM_MARGIN + 1` = 4 blocks before the timelock, mined next block; refund at the timelock | Refund rejected | `bad-txns-inputs-missingorspent` | PASS |
+| B3.11b | gap | Same claim, but no block includes it before the timelock (`generateblock` with `[]`); refund at the timelock | Refund replaces the unconfirmed claim | Replaced; Alice paid and holds `sk3` | PASS (gap reproduced) |
+
+- **Totals:** 14 rows, 14 PASS (3 of them reproduce known gaps as intended), 0 FAIL.
+- **Not covered:** a public testnet (real confirmation delays, fee market); an EVM chain;
+  CPFP fee-bumping by the Bank; anything on Android.
+
+## Run 2026-10-26 (5) — Part C: the FDE coin purchase wired into the server (Bitcoin regtest)
+
+- **Code:** commit `b9615c9` plus uncommitted: `server/rustcode/src/fde.rs` (13 PyO3 functions
+  over the PoC crate), `server/poc_adaptor_sig/src/btc.rs` (B3's transaction code moved into the
+  library), `Proof::to_bytes`/`from_bytes` in `src/dleq.rs`, `server/server.py` (`/api/fde/bank`,
+  `/api/fde/offer`, `/api/fde/claim`, `test_fde_regtest`).
+- **Environment:** as run (4); `rustcode` rebuilt with `bash build.sh`. Flask test client; only
+  `verify_attestation` mocked. Real `bitcoind` for funding, confirmation, broadcast and reading.
+- **Randomness:** `rand::thread_rng()` for every per-coin secret (Waters `r`, `x`, `b`, nonces,
+  Bank key when `BTC_BANK_KEY` is unset).
+- **Command:** `python3 -c "from server import test_fde_regtest; test_fde_regtest()"`; exited 0
+  twice, ~6 s. Regression: `test_gs_full`, `test_redelegate_full`, `test_denomination_trust`,
+  `b3_bitcoin_regtest` all exited 0.
+
+| # | Kind | Case | Expected | Observed | Result |
+|---|---|---|---|---|---|
+| C1 | positive | `GET /api/fde/bank`; Alice pins `bank_pk` | Key and lock parameters | As expected | PASS |
+| C2 | negative | Offer request with a rejected attestation / none / malformed Alice key | 403 / 400 / 400 | As expected | PASS |
+| C3 | positive | Honest offer (denomination 2): Bank signature, no `beta_secret`, lock address rebuilt by Alice, amount, attested-key hash, encrypted key + cross-group proof | All hold | All hold; verify 235 ms, offer 114 211 bytes as JSON | PASS |
+| C4 | negative | Terms altered in transit; `c2` from another offer; `Y_chain` from another offer; key checked against another tag | Alice rejects each | Rejected | PASS |
+| C5 | negative | Claim before the lock confirms | 409 | 409 | PASS |
+| C6 | negative | Pre-signature over a different transaction | 400 (`pre-signature invalid`), output unspent | As expected | PASS |
+| C7 | negative | Claim against an underfunded lock (right address, 1 000 sat short) | 400 (`not the agreed lock`) | As expected | PASS |
+| C8 | positive | Honest claim; Alice reads the claim from the block, extracts `x`, decrypts | Bank paid; key verifies for her tag, not another | As expected | PASS |
+| C9 | negative | Second claim on the same offer | 409 | 409 | PASS |
+| C10 | negative / positive | Claim 12 blocks before the timelock; refund before / at the timelock; claim afterwards | 409 (x not revealed); `non-final`; refund confirms; 409 | As expected | PASS |
+
+- **Totals:** 26 checks in 10 groups, 26 PASS, 0 FAIL.
+- **Not covered:** a real attestation chain (mocked; the gate calls the existing
+  `verify_attestation`); a confidential channel (plain HTTP); Android; re-delegation over FDE;
+  persistence of offers across server restarts.

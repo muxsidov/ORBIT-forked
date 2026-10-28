@@ -31,3 +31,7 @@ sha3 = "0.10"
 num-bigint = {version="0.4.4", features = ["rand"]}
 hex = "0.4"
 rand = "0.8"
+# Part C (CLAUDE_replace_HTLC.md): the FDE purchase on Bitcoin reuses the tested PoC crypto.
+poc_adaptor_sig = { path = "../poc_adaptor_sig" }
+ark-secp256k1 = "0.5"
+bitcoin = "0.32"

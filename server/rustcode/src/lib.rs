@@ -1,5 +1,6 @@
 // mod bbgwild;
 // mod waters;
+mod fde;
 mod pbcrypto;
 
 use core::hash;
@@ -1449,6 +1450,19 @@ fn rustcode(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(garble_waters, m)?)?;
     m.add_function(wrap_pyfunction!(garble_redelegate, m)?)?;
     m.add_function(wrap_pyfunction!(garble_ecdsa, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::fde_keypair, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::fde_pubkey, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::fde_sign, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::fde_verify_sig, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::fde_make_offer, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::fde_verify_offer, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::btc_lock, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::btc_p2wpkh_address, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::btc_spend, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::fde_presign, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::fde_complete_claim, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::btc_sign_refund, m)?)?;
+    m.add_function(wrap_pyfunction!(fde::fde_extract_decrypt, m)?)?;
     // m.add_function(wrap_pyfunction!(poseidon, m)?)?;
 
     // m.add_class::<RustStruct>()?;

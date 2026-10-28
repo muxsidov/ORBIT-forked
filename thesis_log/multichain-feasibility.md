@@ -158,3 +158,29 @@ guarantees. The same rules apply to every atomic-swap protocol.
 **Implication:** For the thesis, state the verdict as: multi-chain fair exchange is feasible
 with chain-native ECDSA, under a claim-margin rule and an authenticated, confidential channel.
 Binding the delivered key to the device is an open design question for Part C.
+
+## 2026-10-26 — Verdict confirmed on a real chain and in the server
+
+**Attempt:** B3 ran the two-signature lock on a Bitcoin Core regtest node, and Part C wired the
+whole purchase into the Flask server (`ecdsa-adaptor-secp256k1.md`, same date).
+
+**Result:** Success. The ORBIT Waters key was bought and delivered through a real Bitcoin
+transaction (B3: 14/14 cases; Part C: 26/26 checks), with no pairing and no contract on-chain.
+
+**Details:**
+- *On-chain.* The only operations are a 112-byte P2WSH script with two `CHECKSIG`s and a CLTV.
+  The claim is a 148-vbyte transaction that Bitcoin Core accepts under its standard rules.
+- *Front-running.* A redirect of the payment is rejected by consensus, not only by mempool
+  policy.
+- *Timing rule.* The rule from the threat review must read "the claim **confirms** before the
+  timelock". Broadcasting inside the window is not enough.
+
+**Why:** Everything pairing-based is checked off-chain by Alice. The chain checks only ordinary
+ECDSA signatures and a timelock, which every secp256k1-ECDSA chain offers.
+
+**Implication:** The thesis can claim a working multi-chain-ready payment layer, demonstrated
+on Bitcoin. The prototype now runs the same Waters coin on two settlement layers: the Sepolia
+HTLC and the Bitcoin FDE lock. The remaining costs are practical, not feasibility questions:
+- offer size (114 KB as JSON);
+- Alice's software secp256k1 key;
+- the confirmation margin.

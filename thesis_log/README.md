@@ -69,6 +69,14 @@ including the privacy/linkability tradeoffs that extension introduced.
   Security Analysis — the brute-force-linkability finding (2026-10-01) is directly usable in a
   limitations/threat-model discussion.
 
+### [Two-Bank Refund Design](two-bank-refund-design.md)
+Design of the payback/refund path for a Bitcoin-only coin purchase from two banks (supervisor's
+proposal; at least one bank honest), replacing or complementing the single-bank timelock refund.
+- **Scope test:** refund/payback mechanisms and multi-bank settlement for the FDE purchase. The
+  single-bank adaptor lock and its tests stay in `ecdsa-adaptor-secp256k1.md`.
+- **Thesis use:** System Design (settlement without a single trusted seller) and Security
+  Analysis (honest-minority bank assumption, collusion cases).
+
 ## Conventions
 
 - **Picking a topic file for a new entry:** match against the scope tests above. If genuinely

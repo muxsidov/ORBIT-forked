@@ -18,7 +18,7 @@
 use ark_ec::short_weierstrass::{Affine, Projective, SWCurveConfig};
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{Field, PrimeField, UniformRand, Zero};
-use ark_serialize::CanonicalSerialize;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::Rng;
 use sha2::{Digest, Sha256};
 
@@ -62,6 +62,48 @@ impl<A: SWCurveConfig, B: SWCurveConfig> Proof<A, B> {
                     + p.z0b.compressed_size() * 2
             })
             .sum()
+    }
+}
+
+impl<A: SWCurveConfig, B: SWCurveConfig> Proof<A, B> {
+    /// Wire format: per bit, ca ‖ cb (compressed) ‖ e0 ‖ e1 (16-byte LE) ‖ z0a ‖ z1a ‖ z0b ‖ z1b.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.size_bytes());
+        for p in &self.bits {
+            p.ca.into_affine().serialize_compressed(&mut out).unwrap();
+            p.cb.into_affine().serialize_compressed(&mut out).unwrap();
+            out.extend(p.e0.to_le_bytes());
+            out.extend(p.e1.to_le_bytes());
+            for z in [p.z0a, p.z1a] {
+                z.serialize_compressed(&mut out).unwrap();
+            }
+            for z in [p.z0b, p.z1b] {
+                z.serialize_compressed(&mut out).unwrap();
+            }
+        }
+        out
+    }
+
+    /// Inverse of `to_bytes`; None on any malformed or off-curve element, or trailing bytes.
+    pub fn from_bytes(mut bytes: &[u8]) -> Option<Self> {
+        let r = &mut bytes;
+        let e = |r: &mut &[u8]| -> Option<u128> {
+            let (head, tail) = r.split_at_checked(16)?;
+            *r = tail;
+            Some(u128::from_le_bytes(head.try_into().ok()?))
+        };
+        let mut bits = Vec::with_capacity(BITS);
+        for _ in 0..BITS {
+            let ca = Affine::<A>::deserialize_compressed(&mut *r).ok()?.into_group();
+            let cb = Affine::<B>::deserialize_compressed(&mut *r).ok()?.into_group();
+            let (e0, e1) = (e(r)?, e(r)?);
+            let z0a = A::ScalarField::deserialize_compressed(&mut *r).ok()?;
+            let z1a = A::ScalarField::deserialize_compressed(&mut *r).ok()?;
+            let z0b = B::ScalarField::deserialize_compressed(&mut *r).ok()?;
+            let z1b = B::ScalarField::deserialize_compressed(&mut *r).ok()?;
+            bits.push(BitProof { ca, cb, e0, e1, z0a, z0b, z1a, z1b });
+        }
+        r.is_empty().then_some(Proof { bits })
     }
 }
 
